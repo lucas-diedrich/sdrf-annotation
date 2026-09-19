@@ -1,0 +1,9 @@
+# Secretes
+.env 
+
+# Setup
+claude_credentials_setup
+
+# Data
+*.csv
+*.tsv
