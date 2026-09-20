@@ -10,9 +10,11 @@ Modules:
     models     Data models and the dataset state machine.
     utils      Filesystem, JSON and text helpers with no pipeline knowledge.
     contracts  Schema validation and artifact hash binding.
+    artifacts  Host-side inspection of the SDRF files on disk.
     prompts    Prompt rendering and the repair brief.
     runner     Docker invocation, output streaming, disk watchdog.
     pipeline   Rollups, the per-dataset loop, batch execution.
+    analysis   Post-hoc aggregation of a finished batch.
     cli        The `annotate` command.
 """
 
