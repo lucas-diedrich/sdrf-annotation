@@ -9,14 +9,17 @@ import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any
 
-from annotate import prompts, runner
+from annotate import artifacts, prompts, runner
 from annotate.contracts import (
     check_agent_artifacts,
+    gap_notes,
     hash_artifacts,
     normalize,
+    sources_notes,
     validate_contract,
 )
 from annotate.models import (
@@ -27,6 +30,7 @@ from annotate.models import (
     DatasetPaths,
     DatasetRollup,
     Event,
+    FailureKind,
     HistoryEntry,
     Outcome,
     RunConfig,
@@ -39,11 +43,13 @@ from annotate.models import (
     transition,
 )
 from annotate.utils import (
+    append_jsonl,
     dir_size_bytes,
     empty_dir,
     extract_last_json_object,
     now_iso,
     read_json,
+    read_jsonl,
     write_json,
 )
 
@@ -90,11 +96,43 @@ def apply_event(
         rollup.failed_step = step
     elif rollup.state not in RETRYABLE_STATES:
         rollup.failed_step = None
-    rollup.history.append(
-        HistoryEntry(rollup.updated, before, event, rollup.state, step, detail)
-    )
+    entry = HistoryEntry(rollup.updated, before, event, rollup.state, step, detail)
+    rollup.history.append(entry)
+    # The rollup is derived and gets rewritten; the event log does not. A
+    # question like "how many datasets failed the contract at least once" is
+    # only answerable from a record that no later re-derivation can revise.
+    append_jsonl(paths.events, entry.to_dict())
     write_json(paths.rollup, rollup.to_dict())
     return rollup
+
+
+def load_history(paths: DatasetPaths) -> list[HistoryEntry]:
+    """Read the dataset's event log.
+
+    Returns:
+        Every recorded entry in order. Entries that no longer parse -- an event
+        name retired since they were written -- are skipped rather than
+        crashing a rebuild.
+    """
+    history: list[HistoryEntry] = []
+    for record in read_jsonl(paths.events):
+        try:
+            history.append(HistoryEntry.from_dict(record))
+        except (KeyError, ValueError):
+            continue
+    return history
+
+
+def seed_events(paths: DatasetPaths, rollup: DatasetRollup) -> None:
+    """Back-fill the event log from a rollup written before the log existed.
+
+    Runs once per dataset: the log is authoritative from then on, and the
+    history inside an older rollup is the only record of those events.
+    """
+    if paths.events.exists() or not rollup.history:
+        return
+    for entry in rollup.history:
+        append_jsonl(paths.events, entry.to_dict())
 
 
 def revalidate(run: RunStatus, paths: DatasetPaths) -> Contract:
@@ -123,14 +161,19 @@ def derive_rollup(paths: DatasetPaths, max_repair: int) -> DatasetRollup:
             `reviewed_fail` (retryable) or `blocked` (cap reached).
 
     Returns:
-        A freshly derived rollup. `history` is not reconstructible from run
-        statuses and is left empty for the caller to preserve.
+        A freshly derived rollup, carrying the event log as its history. The
+        state is derived from the run statuses; the history is read from the
+        log, never reconstructed.
     """
     creator = read_json(paths.status(Step.CREATOR))
     reviewer = read_json(paths.status(Step.REVIEWER))
     attempts = max((run or {}).get("attempt", 0) for run in (creator, reviewer, {}))
     rollup = DatasetRollup(
-        accession=paths.accession, attempts=attempts, updated=now_iso(), derived=True
+        accession=paths.accession,
+        attempts=attempts,
+        updated=now_iso(),
+        derived=True,
+        history=load_history(paths),
     )
 
     if creator is None:
@@ -235,6 +278,28 @@ def _persist_revalidated_runs(paths: DatasetPaths) -> None:
             write_json(paths.status(step), run.to_dict())
 
 
+def _record_rederivation(paths: DatasetPaths, derived: DatasetRollup) -> None:
+    """Append an entry when derivation disagrees with the last recorded event.
+
+    Without it the log ends at `contract_failure` while the state beside it
+    reads `created`, and the two look like a bug. The disagreement is real --
+    a contract fix is retroactive -- so it is recorded rather than hidden.
+    """
+    last = derived.history[-1] if derived.history else None
+    if last is None or last.to_state == derived.state:
+        return
+    entry = HistoryEntry(
+        at=derived.updated,
+        from_state=last.to_state,
+        event=Event.REDERIVED,
+        to_state=derived.state,
+        step=derived.failed_step,
+        detail="re-derived from the run statuses under current contract rules",
+    )
+    derived.history.append(entry)
+    append_jsonl(paths.events, entry.to_dict())
+
+
 def rebuild_rollups(work: Path, max_repair: int) -> int:
     """Regenerate every rollup from the per-run statuses.
 
@@ -244,12 +309,18 @@ def rebuild_rollups(work: Path, max_repair: int) -> int:
     rebuilt = 0
     for logs_dir in sorted(work.glob("*/logs")):
         paths = DatasetPaths(work, logs_dir.parent.name)
+        previous = (
+            DatasetRollup.from_dict(existing)
+            if (existing := read_json(paths.rollup))
+            else None
+        )
+        if previous:
+            seed_events(paths, previous)
         _persist_revalidated_runs(paths)
         derived = derive_rollup(paths, max_repair)
-        if existing := read_json(paths.rollup):
-            previous = DatasetRollup.from_dict(existing)
-            derived.history = previous.history
+        if previous:
             derived.attempts = max(derived.attempts, previous.attempts)
+        _record_rederivation(paths, derived)
         write_json(paths.rollup, derived.to_dict())
         rebuilt += 1
     write_json(work / "status.json", workflow_rollup(work))
@@ -328,6 +399,93 @@ def route_to_sandbox(work: Path, paths: DatasetPaths, reason: str) -> None:
 # --------------------------------------------------------------------------
 
 
+def classify_failure(
+    run: RunResult, contract_error: str | None, payload: dict[str, Any] | None
+) -> FailureKind | None:
+    """Name the cause of a failed run, or None when it succeeded.
+
+    The state machine folds an OOM kill, a docker refusal and an agent that
+    gave up into one `failed_infra`, because the pipeline responds to all
+    three the same way. This separates them for analysis. Order matters: the
+    host's own reasons for killing a container are known precisely and are
+    checked before anything inferred from an exit code.
+
+    Args:
+        run: The raw run result.
+        contract_error: The contract verdict, if the run failed it.
+        payload: The agent's validated output, when there was one.
+
+    Returns:
+        The failure kind, or None.
+    """
+    if run.over_budget:
+        return FailureKind.DISK_BUDGET
+    if run.auth_failed:
+        return FailureKind.AUTH
+    if run.timed_out:
+        return FailureKind.TIMEOUT
+    if run.api_error_status:
+        return FailureKind.API_ERROR
+    if run.exit_code in (125, 126, 127):
+        return FailureKind.DOCKER_ERROR
+    # 137 is the container's own SIGKILL, almost always the OOM killer. A
+    # timeout or budget kill terminates the docker client instead and reports
+    # a negative code, and both are already handled above.
+    if run.exit_code == 137:
+        return FailureKind.OOM
+    if run.exit_code != 0:
+        return FailureKind.AGENT_FAILED
+    if contract_error:
+        return FailureKind.CONTRACT
+    if (payload or {}).get("outcome") == Outcome.FAILED:
+        return FailureKind.AGENT_FAILED
+    return None
+
+
+def summarize_artifacts(
+    paths: DatasetPaths, step: Step, config: RunConfig
+) -> list[dict[str, Any]]:
+    """Describe the SDRF files on disk, validating them unless disabled.
+
+    Host-side, so it holds for a dataset whose reviewer never ran -- otherwise
+    `created` records that a file exists and nothing about whether it parses.
+    """
+    if not config.validate_artifacts:
+        return artifacts.summarize(paths.sdrf)
+    scratch = paths.step_dir(step) / ".validate"
+    try:
+        return artifacts.summarize(
+            paths.sdrf,
+            validate=partial(runner.validate_sdrf, config=config),
+            scratch=scratch,
+        )
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def host_notes(
+    paths: DatasetPaths, step: Step, run: RunResult, payload: dict[str, Any] | None
+) -> list[str]:
+    """Observations the host records about a run without acting on them.
+
+    Everything here is bookkeeping for the batch-level analysis: none of it
+    can fail a run, and none of it is taken from the agent's own account.
+    """
+    notes: list[str] = []
+    if run.stderr_tail:
+        notes.append(f"stderr tail: {run.stderr_tail}")
+    if step is Step.REVIEWER:
+        if payload and not paths.report().is_file():
+            notes.append(f"no review report at review/{paths.report().name}")
+        return notes
+    if not payload:
+        return notes
+    notes += gap_notes(payload, artifacts.sdrf_columns(paths.sdrf))
+    if payload.get("outcome") == Outcome.COMPLETED:
+        notes += sources_notes(paths.files)
+    return notes
+
+
 def write_run_status(
     paths: DatasetPaths,
     step: Step,
@@ -335,9 +493,11 @@ def write_run_status(
     run: RunResult,
     payload: dict[str, Any] | None,
     contract_error: str | None,
-    artifacts: dict[str, str],
+    hashes: dict[str, str],
     started: str,
     notes: list[str] | None = None,
+    artifact_summary: list[dict[str, Any]] | None = None,
+    provenance: dict[str, str] | None = None,
 ) -> RunStatus:
     """Persist the host's record of one run. This is the authoritative artifact."""
     status = RunStatus(
@@ -351,11 +511,16 @@ def write_run_status(
         duration_s=round(run.duration_s, 1),
         exit_code=run.exit_code,
         timed_out=run.timed_out,
+        failure_kind=classify_failure(run, contract_error, payload),
         outcome=(payload or {}).get("outcome"),
         verdict=(payload or {}).get("verdict"),
         blocked_reason=(payload or {}).get("blocked_reason") or run.over_budget or None,
-        artifacts=[{"path": p, "sha256": h} for p, h in sorted(artifacts.items())],
+        artifacts=[{"path": p, "sha256": h} for p, h in sorted(hashes.items())],
+        artifact_summary=artifact_summary or [],
         usage=run.usage,
+        api_error_status=run.api_error_status,
+        permission_denials=run.permission_denials,
+        provenance=provenance or {},
         contract=Contract(valid=contract_error is None, error=contract_error),
         notes=notes or [],
         agent_output=payload or {},
@@ -449,6 +614,8 @@ def run_step(
     """
     attempt = rollup.attempts
     if not config.dry_run:
+        if step is Step.REVIEWER:
+            runner.rotate_review(paths, attempt)
         runner.rotate_step_dir(paths, step, attempt)
         apply_event(paths, rollup, Event.start(step), step=step)
 
@@ -479,8 +646,19 @@ def run_step(
         contract_error, notes = check_agent_artifacts(step, payload, on_disk)
 
     runner.prune_config_dir(paths, step)
+    notes += host_notes(paths, step, run, payload)
     write_run_status(
-        paths, step, attempt, run, payload, contract_error, on_disk, started, notes
+        paths,
+        step,
+        attempt,
+        run,
+        payload,
+        contract_error,
+        on_disk,
+        started,
+        notes,
+        artifact_summary=summarize_artifacts(paths, step, config),
+        provenance=runner.image_provenance(config.image),
     )
 
     # A disk breach is checked first: the run was killed, so it has no usable

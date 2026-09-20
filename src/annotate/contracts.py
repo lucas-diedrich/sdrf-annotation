@@ -16,14 +16,24 @@ from typing import Any
 import jsonschema
 
 from annotate.models import Step
-from annotate.utils import sha256_file
+from annotate.utils import read_json, sha256_file
 
 SCHEMA_DIR = Path(__file__).parent / "schemas"
+SOURCES_FILE = "sources.json"
+
+# Free text the agent may use where it has no column to name. Counted as one
+# bucket rather than treated as a column that does not exist.
+NO_COLUMN = None
 
 
 @cache
 def load_schema(role: Step) -> dict[str, Any]:
     return json.loads((SCHEMA_DIR / f"{role}.schema.json").read_text())
+
+
+@cache
+def load_sources_schema() -> dict[str, Any]:
+    return json.loads((SCHEMA_DIR / "sources.schema.json").read_text())
 
 
 def normalize(step: Step, payload: dict[str, Any]) -> dict[str, Any]:
@@ -43,14 +53,23 @@ def normalize(step: Step, payload: dict[str, Any]) -> dict[str, Any]:
     Returns:
         The payload in the current shape. Unchanged when already current.
     """
-    if step is not Step.CREATOR or "artifacts" not in payload:
+    if step is not Step.CREATOR:
         return payload
     migrated = dict(payload)
-    legacy = migrated.pop("artifacts") or []
-    migrated.setdefault(
-        "sdrf_files",
-        [p for p in legacy if isinstance(p, str) and p.startswith("sdrf/")],
-    )
+    if "artifacts" in migrated:
+        legacy = migrated.pop("artifacts") or []
+        migrated.setdefault(
+            "sdrf_files",
+            [p for p in legacy if isinstance(p, str) and p.startswith("sdrf/")],
+        )
+    # `unresolved` was a flat list of sentences, which cannot be counted across
+    # datasets. Migrated entries keep the sentence and carry a null column, so
+    # an old run stays valid and is simply absent from any per-column tally.
+    if any(isinstance(item, str) for item in migrated.get("unresolved", [])):
+        migrated["unresolved"] = [
+            {"column": NO_COLUMN, "detail": item} if isinstance(item, str) else item
+            for item in migrated["unresolved"]
+        ]
     return migrated
 
 
@@ -181,3 +200,65 @@ def _declaration_notes(declared: Iterable[str], on_disk: dict[str, str]) -> list
     if undeclared := sorted(set(on_disk) - declared_set):
         notes.append(f"on disk but not declared: {', '.join(undeclared)}")
     return notes
+
+
+def gap_notes(payload: dict[str, Any], columns: set[str]) -> list[str]:
+    """Check that every reported gap names a column the SDRF actually has.
+
+    The column is the only part of a gap that is counted across datasets, so a
+    typo silently splits a tally in two. A note, never a rejection: this is
+    bookkeeping and must not fail a run that produced a good SDRF.
+
+    Args:
+        payload: The creator's validated output.
+        columns: Every column name present in the dataset's SDRF files.
+
+    Returns:
+        One note per field that named a column not in the file.
+    """
+    notes: list[str] = []
+    for field in ("spec_gaps", "unresolved"):
+        unknown = sorted(
+            {
+                entry["column"]
+                for entry in payload.get(field) or []
+                if entry.get("column") and entry["column"] not in columns
+            }
+        )
+        if unknown:
+            notes.append(
+                f"{field} names column(s) absent from the SDRF: " + ", ".join(unknown)
+            )
+    return notes
+
+
+def sources_notes(files_dir: Path) -> list[str]:
+    """Check the creator's provenance record against the core it must carry.
+
+    Recorded as notes rather than enforced: the corpus is only worth anything
+    if it spans every dataset, and rejecting a 30-minute annotation over a
+    malformed bookkeeping file would leave gaps in exactly the runs that
+    already cost the most.
+
+    Args:
+        files_dir: The dataset's `files/` directory.
+
+    Returns:
+        Notes describing what is missing. Empty when the record is sound.
+    """
+    path = files_dir / SOURCES_FILE
+    if not path.is_file():
+        return [f"files/{SOURCES_FILE} missing"]
+    payload = read_json(path)
+    if payload is None:
+        return [f"files/{SOURCES_FILE} is not readable JSON"]
+    validator = jsonschema.Draft202012Validator(load_sources_schema())
+    errors = sorted(validator.iter_errors(payload), key=lambda e: list(e.absolute_path))
+    if not errors:
+        return []
+    first = errors[0]
+    location = "/".join(str(part) for part in first.absolute_path) or "<root>"
+    return [
+        f"files/{SOURCES_FILE} does not carry the required core "
+        f"({len(errors)} problem(s), first at {location}: {first.message[:200]})"
+    ]

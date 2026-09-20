@@ -43,6 +43,48 @@ def write_json(path: Path, payload: Any) -> None:
     tmp.replace(path)
 
 
+def append_jsonl(path: Path, payload: Any) -> None:
+    """Append one JSON record to a line-delimited log.
+
+    Opened in append mode on every call rather than held open: the log has to
+    survive a crash mid-batch, and several datasets write their own log
+    concurrently.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        handle.write(json.dumps(payload, sort_keys=False) + "\n")
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Read a line-delimited JSON log, skipping any line that does not parse.
+
+    A truncated final line is expected after a kill and must not lose the
+    records before it.
+    """
+    records: list[dict[str, Any]] = []
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return records
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def tail_text(path: Path, limit: int) -> str:
+    """Return at most the last `limit` characters of a text file."""
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return ""
+    return text[-limit:].strip()
+
+
 def dir_size_bytes(path: Path) -> int:
     total = 0
     for root, _, names in os.walk(path):

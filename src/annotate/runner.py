@@ -13,13 +13,33 @@ import subprocess
 import threading
 import time
 import uuid
+from functools import cache
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
 from annotate.models import DatasetPaths, RunConfig, RunResult, Step
-from annotate.utils import dir_size_bytes, load_env_file
+from annotate.utils import dir_size_bytes, load_env_file, tail_text
 
 API_KEY_VAR = "ANTHROPIC_API_KEY"
+
+# How much of a failing run's stderr is worth keeping. Enough for a stack trace
+# or a docker refusal, short enough to sit inside a status file.
+STDERR_TAIL_CHARS = 2048
+
+# The specification validator is bounded separately from the agent: it is a
+# single offline `parse_sdrf` call that takes ~12 s, so anything near this
+# means it is stuck rather than slow.
+VALIDATION_TIMEOUT_S = 300
+
+# Read from the image rather than asserted by the host: a batch spanning days
+# cannot be partitioned by code version afterwards unless each run says which
+# image and which skills produced it, and neither is backfillable.
+_PROVENANCE_SCRIPT = """
+git -C "$SDRF_SKILLS_HOME" rev-parse HEAD 2>/dev/null || echo unknown
+sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' \
+    "$SDRF_SKILLS_HOME/.claude-plugin/plugin.json" 2>/dev/null | head -1
+"""
 
 # `claude -p` reports an unusable credential as ordinary output rather than a
 # distinct exit code, so it has to be recognised from the stream.
@@ -144,7 +164,9 @@ def build_docker_command(
     """Assemble the `docker run` argv for one agent.
 
     The reviewer gets the three data mounts read-only, which is what stops it
-    quietly becoming a producer. `logs/` is mounted nowhere, so an agent has no
+    quietly becoming a producer. `review/` inverts that: the reviewer writes
+    its report there and the creator may only read it, so neither agent can
+    edit the other's output. `logs/` is mounted nowhere, so an agent has no
     path to the host's records of it.
 
     Args:
@@ -158,8 +180,10 @@ def build_docker_command(
         The full docker argv.
     """
     read_only = ":ro" if step is Step.REVIEWER else ""
+    review_only = "" if step is Step.REVIEWER else ":ro"
     config_dir = paths.config_dir(step)
     config_dir.mkdir(parents=True, exist_ok=True)
+    paths.review.mkdir(parents=True, exist_ok=True)
     scratch_bytes = int(config.scratch_gb * 1024**3)
     return [
         "docker", "run", "--rm",
@@ -174,6 +198,7 @@ def build_docker_command(
         "-v", f"{paths.sdrf.resolve()}:/workspace/sdrf{read_only}",
         "-v", f"{paths.files.resolve()}:/workspace/files{read_only}",
         "-v", f"{paths.raw.resolve()}:/workspace/raw{read_only}",
+        "-v", f"{paths.review.resolve()}:/workspace/review{review_only}",
         "-v", f"{config_dir.resolve()}:/.claude",
         config.image,
         "claude", "-p",
@@ -184,21 +209,67 @@ def build_docker_command(
     ]  # fmt: skip
 
 
+_TOKEN_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
+
+def accumulate_usage(
+    totals: dict[str, Any], message: dict[str, Any], seen: set[str]
+) -> None:
+    """Fold one assistant message's usage into a running total, by model.
+
+    One message arrives as several stream events -- thinking, then text, then
+    each tool call -- and every one of them repeats the same `usage` object.
+    Summing events rather than messages therefore double-counts; measured
+    against a complete run it reported 13.7M cache-read tokens for 7.4M
+    actually billed.
+
+    Args:
+        totals: The accumulator, mutated in place.
+        message: The `message` object of a stream-json assistant event.
+        seen: Message ids already counted, mutated in place.
+    """
+    usage = message.get("usage") or {}
+    message_id = message.get("id") or ""
+    if not usage or message_id in seen:
+        return
+    seen.add(message_id)
+    for field in _TOKEN_FIELDS:
+        totals[field] = totals.get(field, 0) + usage.get(field, 0)
+    totals["num_turns"] = totals.get("num_turns", 0) + 1
+    # The usage on a message event is emitted as the message starts, so its
+    # output count is whatever had been produced by then -- a floor, and a low
+    # one. Input and cache figures are final and match the result event exactly.
+    totals["output_tokens_partial"] = True
+    per_model = totals.setdefault("model_usage", {})
+    model = per_model.setdefault(message.get("model", "unknown"), {})
+    for field in _TOKEN_FIELDS:
+        model[field] = model.get(field, 0) + usage.get(field, 0)
+
+
 def _consume_stream(
     process: subprocess.Popen, session_log: Any
-) -> tuple[dict[str, Any], str, bool]:
+) -> tuple[dict[str, Any], str, bool, dict[str, Any]]:
     """Tee the agent's stream-json stdout to disk and pull out its final text.
 
     Returns:
-        (result_event, final_text, auth_failed). The `result` event is the
-        stream's last line; the assistant fallback covers a run that produced
-        text but no result event, which would otherwise look like silence.
-        `auth_failed` comes from the per-message `error` field, which names a
-        credential rejection precisely where the result text only hints at it.
+        (result_event, final_text, auth_failed, streamed_usage). The `result`
+        event is the stream's last line; the assistant fallback covers a run
+        that produced text but no result event, which would otherwise look like
+        silence. `auth_failed` comes from the per-message `error` field, which
+        names a credential rejection precisely where the result text only hints
+        at it. `streamed_usage` is accumulated as the stream arrives so a run
+        killed before its result event is still costed.
     """
     result_event: dict[str, Any] = {}
     final_text = ""
     auth_failed = False
+    streamed_usage: dict[str, Any] = {}
+    counted: set[str] = set()
     for line in process.stdout:
         session_log.write(line)
         session_log.flush()
@@ -211,11 +282,13 @@ def _consume_stream(
         if event.get("type") == "result":
             result_event = event
             final_text = event.get("result") or ""
-        elif event.get("type") == "assistant" and not final_text:
-            for block in event.get("message", {}).get("content", []):
-                if block.get("type") == "text":
-                    final_text = block.get("text", "")
-    return result_event, final_text, auth_failed
+        elif event.get("type") == "assistant":
+            accumulate_usage(streamed_usage, event.get("message", {}), counted)
+            if not final_text:
+                for block in event.get("message", {}).get("content", []):
+                    if block.get("type") == "text":
+                        final_text = block.get("text", "")
+    return result_event, final_text, auth_failed, streamed_usage
 
 
 def run_agent(
@@ -262,7 +335,9 @@ def run_agent(
         watchdog = RawBudgetWatchdog(paths.raw, config.raw_budget_gb, process)
         watchdog.start()
         try:
-            result_event, final_text, auth_failed = _consume_stream(process, session_log)
+            result_event, final_text, auth_failed, streamed = _consume_stream(
+                process, session_log
+            )
             exit_code = process.wait()
         finally:
             timed_out = not killer.is_alive() and killer.finished.is_set()
@@ -282,7 +357,103 @@ def run_agent(
         final_text=final_text,
         over_budget=watchdog.breach,
         auth_failed=auth_failed or looks_like_auth_failure(result_event, final_text),
+        streamed_usage=streamed,
+        stderr_tail=tail_text(step_dir / "stderr.log", STDERR_TAIL_CHARS),
     )
+
+
+@cache
+def image_provenance(image: str) -> dict[str, str]:
+    """Identify the image and the skills inside it.
+
+    Cached per image: one container start per batch, and the answer cannot
+    change while a batch is running.
+
+    Args:
+        image: The container image tag.
+
+    Returns:
+        {image, image_id, skills_commit, skills_version}. A field that could
+        not be read is omitted rather than guessed.
+    """
+    provenance: dict[str, str] = {"image": image}
+    try:
+        ids = subprocess.run(
+            ["docker", "images", "--no-trunc", "-q", image],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        probe = subprocess.run(
+            ["docker", "run", "--rm", "--network", "none", "--entrypoint", "sh",
+             image, "-c", _PROVENANCE_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=VALIDATION_TIMEOUT_S,
+            check=False,
+        )  # fmt: skip
+    except (subprocess.TimeoutExpired, OSError):
+        return provenance
+    if image_id := ids.stdout.strip().splitlines():
+        provenance["image_id"] = image_id[0]
+    lines = probe.stdout.split()
+    if lines and lines[0] != "unknown":
+        provenance["skills_commit"] = lines[0]
+    if len(lines) > 1:
+        provenance["skills_version"] = lines[1]
+    return provenance
+
+
+def validate_sdrf(
+    sdrf_file: Path, templates: list[str], config: RunConfig
+) -> dict[str, Any]:
+    """Run the specification validator over one SDRF, offline, in the image.
+
+    The host has no `parse_sdrf` of its own, so the check runs in the same
+    image the agent used -- which also means it is the same validator version.
+    `--network none` with the baked ontology cache keeps it deterministic.
+
+    Args:
+        sdrf_file: The file to validate. Its parent is mounted read-only.
+        templates: The `--template` values to validate against.
+        config: Run configuration, for the image.
+
+    Returns:
+        {templates, ran, passed, errors, warnings, detail}. `ran` is False when
+        the validator could not be started at all, which is not a verdict on
+        the file.
+    """
+    result: dict[str, Any] = {"templates": templates, "ran": False, "passed": None}
+    command = [
+        "docker", "run", "--rm", "--network", "none",
+        "-v", f"{sdrf_file.resolve().parent}:/check:ro",
+        config.image,
+        "parse_sdrf", "validate-sdrf", "-s", f"/check/{sdrf_file.name}",
+        *chain.from_iterable(("-t", name) for name in templates),
+        "--use_ols_cache_only",
+    ]  # fmt: skip
+    try:
+        probe = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=VALIDATION_TIMEOUT_S,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as error:
+        result["detail"] = f"validator could not be run: {error}"
+        return result
+
+    lines = (probe.stdout + probe.stderr).splitlines()
+    errors = [line for line in lines if line.startswith("ERROR")]
+    result.update(
+        ran=True,
+        passed=probe.returncode == 0,
+        errors=len(errors),
+        warnings=sum(1 for line in lines if line.startswith("WARNING")),
+        detail=errors[0][:300] if errors else "",
+    )
+    return result
 
 
 def prune_config_dir(paths: DatasetPaths, step: Step) -> None:
@@ -296,20 +467,39 @@ def prune_config_dir(paths: DatasetPaths, step: Step) -> None:
     shutil.rmtree(paths.config_dir(step), ignore_errors=True)
 
 
+def previous_attempt(paths: DatasetPaths, step: Step, attempt: int) -> int:
+    """The attempt number of the run currently on disk for `step`."""
+    try:
+        return json.loads(paths.status(step).read_text()).get("attempt", attempt - 1)
+    except (OSError, json.JSONDecodeError):
+        return attempt - 1
+
+
+def rotate_review(paths: DatasetPaths, attempt: int) -> None:
+    """Archive a previous review report before the reviewer overwrites it.
+
+    `review/` is a data mount, so `rotate_step_dir` does not reach it, and a
+    repair would otherwise leave only the last review of a dataset that was
+    rejected twice for different reasons.
+    """
+    reports = [path for path in paths.review.glob("*") if path.is_file()]
+    if not reports:
+        return
+    archive = paths.review / f"attempt-{previous_attempt(paths, Step.REVIEWER, attempt)}"
+    archive.mkdir(parents=True, exist_ok=True)
+    for report in reports:
+        shutil.move(str(report), str(archive / report.name))
+
+
 def rotate_step_dir(paths: DatasetPaths, step: Step, attempt: int) -> None:
     """Archive the previous run's files under `attempt-<n>/` before overwriting.
 
     Only the per-run status is authoritative, so history must survive a repair.
     """
     step_dir = paths.step_dir(step)
-    previous = step_dir / "status.json"
-    if not previous.exists():
+    if not (step_dir / "status.json").exists():
         return
-    try:
-        previous_attempt = json.loads(previous.read_text()).get("attempt", attempt - 1)
-    except (OSError, json.JSONDecodeError):
-        previous_attempt = attempt - 1
-    archive = step_dir / f"attempt-{previous_attempt}"
+    archive = step_dir / f"attempt-{previous_attempt(paths, step, attempt)}"
     archive.mkdir(parents=True, exist_ok=True)
     for name in (
         "status.json",

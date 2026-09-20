@@ -61,6 +61,11 @@ class Event(StrEnum):
     INFRA_FAILURE = "infra_failure"
     CONTRACT_FAILURE = "contract_failure"
     REPAIR_EXHAUSTED = "repair_exhausted"
+    # Not a transition and deliberately absent from TRANSITIONS: `transition()`
+    # must reject it. It is written to the event log by a re-derivation whose
+    # result disagrees with the last transition, so the log ends by explaining
+    # the state it sits next to instead of contradicting it.
+    REDERIVED = "rederived"
 
     @staticmethod
     def start(step: Step) -> Event:
@@ -85,6 +90,25 @@ class Verdict(StrEnum):
     PASS = "pass"
     FAIL = "fail"
     BLOCKED = "blocked"
+
+
+class FailureKind(StrEnum):
+    """Why a run failed.
+
+    `failed_infra` covers an OOM kill, a docker error and an agent that
+    self-reported failure, which are different problems with different fixes.
+    The state stays coarse because the pipeline treats all three the same way;
+    this separates them for analysis without splitting the state machine.
+    """
+
+    TIMEOUT = "timeout"
+    OOM = "oom"
+    DOCKER_ERROR = "docker_error"
+    AUTH = "auth"
+    AGENT_FAILED = "agent_failed"
+    DISK_BUDGET = "disk_budget"
+    CONTRACT = "contract"
+    API_ERROR = "api_error"
 
 
 TERMINAL_STATES = frozenset({State.REVIEWED_PASS, State.BLOCKED})
@@ -167,6 +191,7 @@ class RunConfig:
     prompts_dir: Path | None = None
     env_file: Path | None = DEFAULT_ENV_FILE
     preflight: bool = True
+    validate_artifacts: bool = True
 
     def replace(self, **changes: Any) -> RunConfig:
         return replace(self, **changes)
@@ -196,6 +221,19 @@ class DatasetPaths:
         return self.root / "raw"
 
     @property
+    def review(self) -> Path:
+        """The reviewer's report. The one directory only the reviewer writes."""
+        return self.root / "review"
+
+    def report(self, accession: str | None = None) -> Path:
+        """The path the reviewer is told to write its report to.
+
+        Named by the host rather than chosen by the agent: a report the host
+        cannot find afterwards is a report nobody reads.
+        """
+        return self.review / f"{accession or self.accession}.review.json"
+
+    @property
     def logs(self) -> Path:
         """Never mounted into a container, by construction."""
         return self.root / "logs"
@@ -203,6 +241,11 @@ class DatasetPaths:
     @property
     def rollup(self) -> Path:
         return self.logs / "status.json"
+
+    @property
+    def events(self) -> Path:
+        """The append-only event log. Never rewritten by a re-derivation."""
+        return self.logs / "events.jsonl"
 
     def step_dir(self, step: Step) -> Path:
         return self.logs / str(step)
@@ -214,7 +257,7 @@ class DatasetPaths:
         return self.step_dir(step) / "claude-config"
 
     def scaffold(self) -> None:
-        for path in (self.sdrf, self.files, self.raw, self.logs):
+        for path in (self.sdrf, self.files, self.raw, self.review, self.logs):
             path.mkdir(parents=True, exist_ok=True)
         for step in Step:
             self.step_dir(step).mkdir(parents=True, exist_ok=True)
@@ -239,18 +282,45 @@ class RunResult:
     final_text: str = ""
     over_budget: str = ""
     auth_failed: bool = False
+    streamed_usage: dict[str, Any] = field(default_factory=dict)
+    stderr_tail: str = ""
 
     @property
     def usage(self) -> dict[str, Any]:
+        """Token and cost accounting for this run.
+
+        Returns:
+            The result event's `usage` and `modelUsage` verbatim, plus
+            `cost_usd`, `num_turns` and the `source` the numbers came from.
+            When no result event arrived the per-message totals accumulated
+            from the stream stand in and `cost_usd` is None.
+        """
         event = self.result_event or {}
-        usage = event.get("usage") or {}
-        return {
-            "input_tokens": usage.get("input_tokens", 0),
-            "output_tokens": usage.get("output_tokens", 0),
-            "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
-            "cost_usd": event.get("total_cost_usd", 0.0),
-            "num_turns": event.get("num_turns", 0),
-        }
+        # Copied wholesale rather than projected onto a chosen subset: dropping
+        # cache_creation_input_tokens made cost_usd unrecomputable from the
+        # tokens recorded beside it, and dropping modelUsage made Opus and
+        # Haiku spend inseparable without reopening a 100 MB trace.
+        if usage := event.get("usage"):
+            return {
+                **usage,
+                "cost_usd": event.get("total_cost_usd", 0.0),
+                "num_turns": event.get("num_turns", 0),
+                "model_usage": event.get("modelUsage") or {},
+                "source": "result_event",
+            }
+        # A container killed by the timeout or the disk watchdog never emits a
+        # result event. Booking those at zero undercounts precisely the runs
+        # that cost the most, so the stream's per-message usage stands in. No
+        # cost is claimed from it: the stream carries tokens, not prices.
+        return {**self.streamed_usage, "cost_usd": None, "source": "stream"}
+
+    @property
+    def api_error_status(self) -> str | None:
+        return (self.result_event or {}).get("api_error_status")
+
+    @property
+    def permission_denials(self) -> list[dict[str, Any]]:
+        return (self.result_event or {}).get("permission_denials") or []
 
 
 @dataclass(slots=True)
@@ -285,11 +355,16 @@ class RunStatus:
     duration_s: float = 0.0
     exit_code: int = 0
     timed_out: bool = False
+    failure_kind: FailureKind | None = None
     outcome: str | None = None
     verdict: str | None = None
     blocked_reason: str | None = None
     artifacts: list[dict[str, str]] = field(default_factory=list)
+    artifact_summary: list[dict[str, Any]] = field(default_factory=list)
     usage: dict[str, Any] = field(default_factory=dict)
+    api_error_status: str | None = None
+    permission_denials: list[dict[str, Any]] = field(default_factory=list)
+    provenance: dict[str, str] = field(default_factory=dict)
     contract: Contract = field(default_factory=lambda: Contract(valid=False))
     notes: list[str] = field(default_factory=list)
     agent_output: dict[str, Any] = field(default_factory=dict)
@@ -308,11 +383,16 @@ class RunStatus:
             "duration_s": self.duration_s,
             "exit_code": self.exit_code,
             "timed_out": self.timed_out,
+            "failure_kind": str(self.failure_kind) if self.failure_kind else None,
             "outcome": self.outcome,
             "verdict": self.verdict,
             "blocked_reason": self.blocked_reason,
             "artifacts": self.artifacts,
+            "artifact_summary": self.artifact_summary,
             "usage": self.usage,
+            "api_error_status": self.api_error_status,
+            "permission_denials": self.permission_denials,
+            "provenance": self.provenance,
             "contract": self.contract.to_dict(),
             "notes": self.notes,
             "agent_output": self.agent_output,
@@ -331,11 +411,18 @@ class RunStatus:
             duration_s=data.get("duration_s", 0.0),
             exit_code=data.get("exit_code", 0),
             timed_out=data.get("timed_out", False),
+            failure_kind=(
+                FailureKind(data["failure_kind"]) if data.get("failure_kind") else None
+            ),
             outcome=data.get("outcome"),
             verdict=data.get("verdict"),
             blocked_reason=data.get("blocked_reason"),
             artifacts=data.get("artifacts", []),
+            artifact_summary=data.get("artifact_summary", []),
             usage=data.get("usage", {}),
+            api_error_status=data.get("api_error_status"),
+            permission_denials=data.get("permission_denials", []),
+            provenance=data.get("provenance", {}),
             contract=Contract.from_dict(data.get("contract")),
             notes=data.get("notes", []),
             agent_output=data.get("agent_output", {}),

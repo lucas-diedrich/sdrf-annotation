@@ -19,7 +19,7 @@ from typing import Annotated, Any
 
 import typer
 
-from annotate import pipeline, runner
+from annotate import analysis, pipeline, runner
 from annotate.models import (
     DEFAULT_CONCURRENCY,
     DEFAULT_ENV_FILE,
@@ -186,6 +186,10 @@ def run(
     preflight: Annotated[
         bool, typer.Option(help="Verify image and credential before starting.")
     ] = True,
+    validate_artifacts: Annotated[
+        bool,
+        typer.Option(help="Record a host-side parse_sdrf verdict for every SDRF."),
+    ] = True,
 ) -> None:
     """Run the pipeline over the selected datasets."""
     raise typer.Exit(_execute(_config(locals())))
@@ -215,6 +219,7 @@ def retry(
     dry_run: Annotated[bool, typer.Option()] = False,
     prompts_dir: Annotated[Path | None, typer.Option()] = None,
     preflight: Annotated[bool, typer.Option()] = True,
+    validate_artifacts: Annotated[bool, typer.Option()] = True,
 ) -> None:
     """Re-run datasets that failed. Defaults to every failure state."""
     params = dict(locals())
@@ -272,6 +277,62 @@ def rollup(
     rebuilt = pipeline.rebuild_rollups(work, max_repair)
     typer.echo(f"rebuilt {rebuilt} dataset rollup(s) and {work / 'status.json'}")
     _print_summary(work)
+
+
+@app.command()
+def costs(
+    work: WorkOpt = DEFAULT_WORK,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Emit the attribution as JSON.")
+    ] = False,
+) -> None:
+    """Attribute the batch's spend to the phases of work that caused it."""
+    report = analysis.batch_phase_costs(work)
+    if as_json:
+        typer.echo(json.dumps(report, indent=2))
+        raise typer.Exit(EXIT_OK)
+    typer.echo(f"{report['traces']} trace(s), ${report['total_cost_usd']:.2f} total\n")
+    for phase, bucket in report["phases"].items():
+        typer.echo(
+            f"  {phase:<12} ${bucket['cost_usd']:>8.2f}  "
+            f"{bucket['cost_share'] * 100:>5.1f}%  {bucket['messages']:>4} msg"
+        )
+
+
+@app.command()
+def report(
+    work: WorkOpt = DEFAULT_WORK,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Emit the report as JSON.")
+    ] = False,
+) -> None:
+    """Count what the batch recorded: failures, spend, gaps, validation."""
+    summary = analysis.batch_report(work)
+    if as_json:
+        typer.echo(json.dumps(summary, indent=2))
+        raise typer.Exit(EXIT_OK)
+
+    typer.echo(f"{summary['runs']} run(s) in {work}")
+    for step, bucket in summary["by_step"].items():
+        uncosted = f", {bucket['uncosted']} uncosted" if bucket["uncosted"] else ""
+        typer.echo(
+            f"  {step:<10} {bucket['runs']:>3} run(s)  ${bucket['cost_usd']:>8.2f}  "
+            f"{bucket['duration_s'] / 3600:>5.1f} h{uncosted}"
+        )
+    for title, counts in (
+        ("failure kinds", summary["failure_kinds"]),
+        ("specification gaps by column", summary["spec_gaps"]),
+        ("unresolved by column", summary["unresolved"]),
+    ):
+        if counts:
+            typer.echo(f"\n{title}")
+            for name, count in counts.items():
+                typer.echo(f"  {count:>4}  {name}")
+    validation = summary["validation"]
+    typer.echo(
+        f"\nhost-side validation: {validation['passed']} passed, "
+        f"{validation['failed']} failed, {validation['not_run']} not run"
+    )
 
 
 @app.command()
