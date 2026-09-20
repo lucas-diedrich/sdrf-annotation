@@ -8,6 +8,7 @@ import sys
 import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -174,6 +175,11 @@ def workflow_rollup(work: Path) -> dict[str, Any]:
             "attempts": rollup.attempts,
             "updated": rollup.updated,
             "blocked_reason": rollup.blocked_reason,
+            # Why the dataset is where it is. Without this an auth failure reads
+            # as a bare `failed_infra` and the cause stays buried in the trace.
+            "last_detail": next(
+                (e.detail for e in reversed(rollup.history) if e.detail), None
+            ),
         }
     counts: dict[str, int] = {}
     for entry in datasets.values():
@@ -433,6 +439,13 @@ def run_step(
         rollup.blocked_reason = run.over_budget
         apply_event(paths, rollup, Event.blocked(step), step=step, detail=run.over_budget)
         return rollup, None
+    if run.auth_failed:
+        detail = f"authentication failed: {run.final_text.strip()[:120]}"
+        apply_event(paths, rollup, Event.INFRA_FAILURE, step=step, detail=detail)
+        # Recorded first so the dataset is not lost, then raised: every other
+        # dataset would fail identically, so the batch stops rather than
+        # burning 2 runs each on a credential the operator has to fix.
+        raise runner.AuthenticationError(detail)
     if run.exit_code != 0 or run.timed_out:
         detail = "timed out" if run.timed_out else f"exit code {run.exit_code}"
         apply_event(paths, rollup, Event.INFRA_FAILURE, step=step, detail=detail)
@@ -581,9 +594,18 @@ def select_datasets(config: RunConfig) -> list[SeedRow]:
     return rows[: config.limit] if config.limit else rows
 
 
+@dataclass(slots=True)
+class BatchOutcome:
+    """How a batch ended, beyond the per-dataset states."""
+
+    results: dict[str, str] = field(default_factory=dict)
+    interrupted: bool = False
+    auth_error: str = ""
+
+
 def run_batch(
     config: RunConfig, on_result: Callable[[str, str], None] | None = None
-) -> tuple[dict[str, str], bool]:
+) -> BatchOutcome:
     """Process the selected datasets, up to `concurrency` at a time.
 
     Args:
@@ -591,12 +613,11 @@ def run_batch(
         on_result: Called with (accession, state) as each dataset settles.
 
     Returns:
-        ({accession: final state}, interrupted).
+        A BatchOutcome carrying the per-dataset states and how the batch ended.
     """
     config.work.mkdir(parents=True, exist_ok=True)
     targets = select_datasets(config)
-    results: dict[str, str] = {}
-    interrupted = False
+    outcome = BatchOutcome()
 
     with ThreadPoolExecutor(max_workers=config.concurrency) as pool:
         futures = {
@@ -609,13 +630,20 @@ def run_batch(
             for future in as_completed(futures):
                 accession = futures[future]
                 try:
-                    results[accession] = str(future.result().state)
+                    outcome.results[accession] = str(future.result().state)
+                except runner.AuthenticationError as error:
+                    outcome.results[accession] = str(State.FAILED_INFRA)
+                    outcome.auth_error = str(error)
                 except Exception as error:  # noqa: BLE001 - one crash must not sink the batch
-                    results[accession] = f"orchestrator_error: {error}"
+                    outcome.results[accession] = f"orchestrator_error: {error}"
                 if on_result:
-                    on_result(accession, results[accession])
+                    on_result(accession, outcome.results[accession])
+                if outcome.auth_error:
+                    # Nothing else can succeed until the credential is fixed.
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
         except KeyboardInterrupt:
-            interrupted = True
+            outcome.interrupted = True
             # In-flight datasets stay at `creating`/`reviewing`, which the next
             # run treats as resumable and restarts from that step.
             print("\ninterrupted; letting in-flight containers finish", file=sys.stderr)
@@ -623,4 +651,4 @@ def run_batch(
 
     if not config.dry_run:
         write_json(config.work / "status.json", workflow_rollup(config.work))
-    return results, interrupted
+    return outcome

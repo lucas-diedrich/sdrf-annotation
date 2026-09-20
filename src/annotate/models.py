@@ -17,6 +17,7 @@ SCHEMA_VERSION = "1.0.0"
 
 DEFAULT_IMAGE = "sdrf-annotation"
 DEFAULT_SEED = Path("data/datasets.csv")
+DEFAULT_ENV_FILE = Path(".env")
 DEFAULT_WORK = Path("work")
 DEFAULT_CONCURRENCY = 2  # parse_sdrf caps at 2; OLS and PRIDE rate-limit above it
 DEFAULT_RAW_BUDGET_GB = 20.0
@@ -164,6 +165,8 @@ class RunConfig:
     keep_raw: bool = False
     dry_run: bool = False
     prompts_dir: Path | None = None
+    env_file: Path | None = DEFAULT_ENV_FILE
+    preflight: bool = True
 
     def replace(self, **changes: Any) -> RunConfig:
         return replace(self, **changes)
@@ -235,6 +238,7 @@ class RunResult:
     result_event: dict[str, Any] = field(default_factory=dict)
     final_text: str = ""
     over_budget: str = ""
+    auth_failed: bool = False
 
     @property
     def usage(self) -> dict[str, Any]:

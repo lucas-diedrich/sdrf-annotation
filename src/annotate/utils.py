@@ -121,3 +121,33 @@ def extract_last_json_object(text: str) -> tuple[dict[str, Any] | None, str | No
     if not blocks:
         return None, "no fenced JSON block in agent output"
     return None, "no fenced JSON block parsed as a JSON object"
+
+
+def load_env_file(path: Path) -> dict[str, str]:
+    """Parse a `.env` file into a mapping.
+
+    Deliberately minimal -- `KEY=value`, `#` comments, optional `export` prefix
+    and optional surrounding quotes. No interpolation, no multi-line values: a
+    credential file that needs more than this should be exported by the shell.
+
+    Args:
+        path: The file to read. A missing file yields an empty mapping.
+
+    Returns:
+        {name: value} for every assignment found.
+    """
+    values: dict[str, str] = {}
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, value = line.removeprefix("export ").partition("=")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[name.strip()] = value
+    return values

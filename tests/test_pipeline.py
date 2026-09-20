@@ -699,10 +699,10 @@ class TestBatch:
         """Uses the real runner: its dry-run path must not start a container."""
         paths = DatasetPaths(work, ACC)
 
-        results, interrupted = pipeline.run_batch(config.replace(dry_run=True))
+        outcome = pipeline.run_batch(config.replace(dry_run=True))
 
-        assert not interrupted
-        assert results == {ACC: str(State.PENDING)}
+        assert not outcome.interrupted
+        assert outcome.results == {ACC: str(State.PENDING)}
         assert pipeline.load_rollup(paths).state is State.PENDING
         assert (paths.step_dir(Step.CREATOR) / "command.txt").exists()
 
@@ -710,12 +710,10 @@ class TestBatch:
         fake_agent([(Step.CREATOR, creator_ok()), (Step.REVIEWER, reviewer("pass"))])
         seen = []
 
-        results, _ = pipeline.run_batch(
-            config, on_result=lambda a, s: seen.append((a, s))
-        )
+        outcome = pipeline.run_batch(config, on_result=lambda a, s: seen.append((a, s)))
 
         assert seen == [(ACC, str(State.REVIEWED_PASS))]
-        assert results == {ACC: str(State.REVIEWED_PASS)}
+        assert outcome.results == {ACC: str(State.REVIEWED_PASS)}
 
     def test_one_dataset_crashing_does_not_sink_the_batch(
         self, work, config, monkeypatch
@@ -725,6 +723,129 @@ class TestBatch:
 
         monkeypatch.setattr(pipeline, "process_dataset", explode)
 
-        results, _ = pipeline.run_batch(config)
+        outcome = pipeline.run_batch(config)
 
-        assert "orchestrator_error" in results[ACC]
+        assert "orchestrator_error" in outcome.results[ACC]
+
+
+class TestAuthentication:
+    """The failure that burned two runs per dataset with `apiKeySource: none`."""
+
+    AUTH_REFUSAL = (
+        '{"type":"result","is_error":true,"terminal_reason":"api_error",'
+        '"result":"Not logged in \u00b7 Please run /login"}'
+    )
+
+    def _refusing_agent(self, paths):
+        return "Not logged in · Please run /login"
+
+    def test_key_is_resolved_from_the_environment(self, config, monkeypatch):
+        monkeypatch.setenv(runner.API_KEY_VAR, "sk-from-env")
+
+        assert runner.resolve_api_key(config) == "sk-from-env"
+
+    def test_key_falls_back_to_the_env_file(self, config, tmp_path, monkeypatch):
+        monkeypatch.delenv(runner.API_KEY_VAR, raising=False)
+        env_file = tmp_path / "custom.env"
+        env_file.write_text(f'# comment\nexport {runner.API_KEY_VAR}="sk-from-file"\n')
+
+        assert runner.resolve_api_key(config.replace(env_file=env_file)) == "sk-from-file"
+
+    def test_environment_wins_over_the_env_file(self, config, tmp_path, monkeypatch):
+        monkeypatch.setenv(runner.API_KEY_VAR, "sk-from-env")
+        env_file = tmp_path / ".env"
+        env_file.write_text(f"{runner.API_KEY_VAR}=sk-from-file\n")
+
+        assert runner.resolve_api_key(config.replace(env_file=env_file)) == "sk-from-env"
+
+    def test_env_file_may_live_outside_the_repo(self, config, tmp_path, monkeypatch):
+        """The workflow must be runnable from any directory."""
+        monkeypatch.delenv(runner.API_KEY_VAR, raising=False)
+        elsewhere = tmp_path / "somewhere" / "else"
+        elsewhere.mkdir(parents=True)
+        env_file = elsewhere / "secrets.env"
+        env_file.write_text(f"{runner.API_KEY_VAR}=sk-elsewhere\n")
+
+        assert runner.resolve_api_key(config.replace(env_file=env_file)) == "sk-elsewhere"
+
+    def test_missing_credential_raises_with_the_paths_it_searched(
+        self, config, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv(runner.API_KEY_VAR, raising=False)
+        missing = tmp_path / "absent.env"
+
+        with pytest.raises(runner.MissingCredentials, match="absent.env"):
+            runner.resolve_api_key(config.replace(env_file=missing))
+
+    def test_key_reaches_the_container_through_the_environment(self, config, monkeypatch):
+        """Never as `-e KEY=value`: the argv is written to command.txt."""
+        monkeypatch.setenv(runner.API_KEY_VAR, "sk-secret-value")
+        paths = DatasetPaths(config.work, ACC)
+        paths.scaffold()
+
+        command = runner.build_docker_command(Step.CREATOR, paths, "p", "s", config)
+        env = runner.agent_env(config)
+
+        assert runner.API_KEY_VAR in command  # the passthrough form
+        assert not any("sk-secret-value" in arg for arg in command)
+        assert env[runner.API_KEY_VAR] == "sk-secret-value"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Not logged in · Please run /login",
+            "Invalid API key · Please run /login",
+            "OAuth token has expired",
+        ],
+    )
+    def test_refusals_are_recognised(self, text):
+        assert runner.looks_like_auth_failure({}, text)
+
+    def test_a_normal_result_is_not_an_auth_failure(self):
+        assert not runner.looks_like_auth_failure({}, "```json\n{}\n```")
+
+    def test_per_message_error_field_is_recognised(self, tmp_path):
+        stream = tmp_path / "stream.jsonl"
+        stream.write_text(
+            '{"type":"assistant","error":"authentication_failed",'
+            '"message":{"content":[{"type":"text","text":"Not logged in"}]}}\n'
+        )
+
+        class FakeProcess:
+            stdout = stream.read_text().splitlines(keepends=True)
+
+        with (tmp_path / "session.jsonl").open("w") as log:
+            _, _, auth_failed = runner._consume_stream(FakeProcess(), log)
+
+        assert auth_failed
+
+    def test_auth_failure_stops_the_batch_instead_of_retrying(
+        self, work, config, fake_agent
+    ):
+        agent = fake_agent([(Step.CREATOR, self._refusing_agent)])
+
+        outcome = pipeline.run_batch(config)
+
+        assert "authentication failed" in outcome.auth_error
+        # One run, not the two a retryable infra failure would have spent.
+        assert agent.calls == [Step.CREATOR]
+
+    def test_the_dataset_is_still_recorded_before_the_batch_aborts(
+        self, work, config, fake_agent
+    ):
+        fake_agent([(Step.CREATOR, self._refusing_agent)])
+        paths = DatasetPaths(work, ACC)
+
+        pipeline.run_batch(config)
+
+        rollup = pipeline.load_rollup(paths)
+        assert rollup.state is State.FAILED_INFRA
+        assert "authentication failed" in rollup.history[-1].detail
+
+    def test_status_surfaces_why_a_dataset_failed(self, work, config, fake_agent):
+        fake_agent([(Step.CREATOR, self._refusing_agent)])
+        pipeline.run_batch(config)
+
+        summary = pipeline.workflow_rollup(work)
+
+        assert "authentication failed" in summary["datasets"][ACC]["last_detail"]

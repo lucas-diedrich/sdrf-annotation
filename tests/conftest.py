@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from annotate import runner
 from annotate.models import DatasetPaths, RunConfig, RunResult, Step
 
 
@@ -68,6 +69,7 @@ class FakeAgent:
         self.calls.append(step)
         expected_step, producer = self.script.pop(0)
         assert step == expected_step, f"expected a {expected_step} run, got {step}"
+        final_text = producer(paths)
         return RunResult(
             exit_code=self.exit_code,
             timed_out=self.timed_out,
@@ -79,8 +81,11 @@ class FakeAgent:
                 "total_cost_usd": 0.1,
                 "usage": {"input_tokens": 10, "output_tokens": 20},
             },
-            final_text=producer(paths),
+            final_text=final_text,
             over_budget=self.over_budget,
+            # Classified exactly as the real runner does, so a test that fakes a
+            # credential refusal exercises the same branch.
+            auth_failed=runner.looks_like_auth_failure({}, final_text),
         )
 
 
