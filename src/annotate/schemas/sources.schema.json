@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/bigbio/sdrf-autoannotation/schemas/sources.schema.json",
+  "title": "Creator provenance record (files/sources.json)",
+  "description": "Only the core is pinned. Agents add their own fields and should keep doing so; what matters is that every annotation's provenance can be read the same way across a whole batch.",
+  "type": "object",
+  "required": ["accession", "sources"],
+  "properties": {
+    "accession": { "type": "string", "pattern": "^[A-Z]{3}[A-Z0-9]*[0-9]+$" },
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/source" }
+    }
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "required": ["id", "used_for"],
+      "anyOf": [
+        { "required": ["url"] },
+        { "required": ["urls"] },
+        { "required": ["local"] }
+      ],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "url": { "type": "string" },
+        "urls": { "type": "array", "items": { "type": "string" } },
+        "local": { "type": "string" },
+        "used_for": {
+          "oneOf": [
+            { "type": "string", "minLength": 1 },
+            { "type": "array", "minItems": 1, "items": { "type": "string" } }
+          ]
+        }
+      }
+    }
+  }
+}

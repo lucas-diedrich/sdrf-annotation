@@ -26,13 +26,22 @@
       "type": "array",
       "items": {
         "type": "string"
-      }
+      },
+      "description": "Inferences the evidence supports but does not state. Prose, deliberately: these are read when auditing one dataset, not counted across many."
     },
     "unresolved": {
       "type": "array",
       "items": {
-        "type": "string"
-      }
+        "$ref": "#/$defs/gap"
+      },
+      "description": "Values the sources never stated. Nothing upstream can fix these."
+    },
+    "spec_gaps": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/gap"
+      },
+      "description": "Values the specification cannot express. Kept apart from unresolved because these are actionable by the SDRF maintainers."
     },
     "sdrf_files": {
       "type": "array",
@@ -102,6 +111,22 @@
     "accession": {
       "type": "string",
       "pattern": "^[A-Z]{3}[A-Z0-9]*[0-9]+$"
+    },
+    "gap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["column", "detail"],
+      "properties": {
+        "column": {
+          "type": ["string", "null"],
+          "description": "The SDRF column the trouble is in. This is the only field that gets counted across datasets, so it must be a real column name. Null only where a run predating this contract was migrated."
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1,
+          "description": "One sentence, read after a count points at the column. Never parsed."
+        }
+      }
     }
   }
 }
