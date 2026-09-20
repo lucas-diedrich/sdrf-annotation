@@ -22,7 +22,8 @@ rm -rf claude_credentials_setup && mkdir claude_credentials_setup
 source .env # You need to provide your Anthropic API key
 docker run --rm -it \
   -v "$(pwd)/claude_credentials_setup:/.claude" \
-  -e CLAUDE_CONFIG_DIR=/.claude -e ANTHROPIC_API_KEY \
+  -e CLAUDE_CONFIG_DIR=/.claude \
+  -e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY" \
   sdrf-annotation claude
 ```
 
