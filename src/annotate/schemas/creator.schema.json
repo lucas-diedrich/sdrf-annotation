@@ -4,13 +4,7 @@
   "title": "SDRF creator agent output contract",
   "type": "object",
   "additionalProperties": false,
-  "required": [
-    "schema_version",
-    "role",
-    "accession",
-    "outcome",
-    "artifacts"
-  ],
+  "required": ["schema_version", "role", "accession", "outcome", "artifacts"],
   "properties": {
     "schema_version": {
       "const": "1.0.0"
@@ -22,17 +16,10 @@
       "$ref": "#/$defs/accession"
     },
     "outcome": {
-      "enum": [
-        "completed",
-        "blocked",
-        "failed"
-      ]
+      "enum": ["completed", "blocked", "failed"]
     },
     "blocked_reason": {
-      "type": [
-        "string",
-        "null"
-      ],
+      "type": ["string", "null"],
       "minLength": 1
     },
     "assumptions": {
@@ -58,9 +45,7 @@
     "raw_files": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "paths"
-      ],
+      "required": ["paths"],
       "properties": {
         "paths": {
           "type": "array",
@@ -83,9 +68,7 @@
             "const": "completed"
           }
         },
-        "required": [
-          "outcome"
-        ]
+        "required": ["outcome"]
       },
       "then": {
         "properties": {
@@ -102,14 +85,10 @@
             "const": "blocked"
           }
         },
-        "required": [
-          "outcome"
-        ]
+        "required": ["outcome"]
       },
       "then": {
-        "required": [
-          "blocked_reason"
-        ],
+        "required": ["blocked_reason"],
         "properties": {
           "blocked_reason": {
             "type": "string",

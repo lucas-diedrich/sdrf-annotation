@@ -1,46 +1,48 @@
 [build-system]
-requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
+requires = [ "setuptools>=77" ]
 
 [project]
 name = "annotate"
 version = "0.0.1"
 description = "Two-agent SDRF auto-annotation pipeline over PRIDE accessions"
-requires-python = ">=3.12"
 license = "Apache-2.0"
 
+requires-python = ">=3.12"
+classifiers = [
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
 # Deliberately minimal. The pipeline shells out to `docker run` and hashes
 # artifacts itself, so it needs no docker SDK and no HTTP client: everything
 # that talks to PRIDE, OLS or PubMed runs inside the container.
 dependencies = [
-    # Validates the agents' JSON output against the creator/reviewer schemas.
-    # This is what separates a `failed_contract` run (agent emitted unparseable
-    # or off-schema JSON) from `failed_infra` (container crashed) -- the two
-    # need different fixes, so the distinction has to be mechanical rather than
-    # guessed from an exit code.
-    "jsonschema>=4.21",
-    "typer>=0.12",
+  # Validates the agents' JSON output against the creator/reviewer schemas.
+  # This is what separates a `failed_contract` run (agent emitted unparseable
+  # or off-schema JSON) from `failed_infra` (container crashed) -- the two
+  # need different fixes, so the distinction has to be mechanical rather than
+  # guessed from an exit code.
+  "jsonschema>=4.21",
+  "typer>=0.12",
 ]
 
-[project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.6"]
-
-[project.scripts]
-annotate = "annotate.cli:main"
+optional-dependencies.dev = [ "pre-commit", "pytest>=8", "ruff>=0.6" ]
+scripts.annotate = "annotate.cli:main"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = [ "src" ]
 
 [tool.setuptools.package-data]
-annotate = ["prompts/*.md", "schemas/*.json"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-q"
+annotate = [ "prompts/*.md", "schemas/*.json" ]
 
 [tool.ruff]
 line-length = 90
-src = ["src", "tests"]
+src = [ "src", "tests" ]
 
-[tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
+lint.select = [ "B", "E", "F", "I", "SIM", "UP" ]
+
+[tool.pytest.ini_options]
+testpaths = [ "tests" ]
+addopts = "-q"

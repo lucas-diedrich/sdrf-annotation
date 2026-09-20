@@ -9,11 +9,11 @@ specification for how to annotate.
 
 ## Deliverables
 
-| Path | Contents |
-|------|----------|
-| `sdrf/` | The SDRF only, as `{{ACCESSION}}.sdrf.tsv`, or `{{ACCESSION}}-<template>.sdrf.tsv` per template when the rows split. |
+| Path     | Contents                                                                                                                                                                |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sdrf/`  | The SDRF only, as `{{ACCESSION}}.sdrf.tsv`, or `{{ACCESSION}}-<template>.sdrf.tsv` per template when the rows split.                                                    |
 | `files/` | Evidence you relied on, plus `sources.json`: every source you opened, its URL or identifier, and what you took from it. The reviewer reads this instead of re-fetching. |
-| `raw/` | Raw MS files, if you need any. |
+| `raw/`   | Raw MS files, if you need any.                                                                                                                                          |
 
 Everything else is transient and discarded when the container exits. Do not run
 `/sdrf-skills:sdrf-contribute`, `git`, or `gh` — publication is the host's
@@ -60,18 +60,21 @@ End your final message with one fenced ```json block and nothing after it:
   "accession": "{{ACCESSION}}",
   "outcome": "completed",
   "blocked_reason": null,
-  "assumptions": ["label-free inferred from absence of TMT reagents in Methods"],
+  "assumptions": [
+    "label-free inferred from absence of TMT reagents in Methods"
+  ],
   "unresolved": ["sample->file mapping for 4 runs not determinable"],
   "artifacts": ["sdrf/{{ACCESSION}}.sdrf.tsv"]
 }
 ```
 
-`outcome` 
-  - `completed`
-  - `blocked`
-  - `failed`
-  
-`blocked` needs a `blocked_reason`. 
+`outcome`
+
+- `completed`
+- `blocked`
+- `failed`
+
+`blocked` needs a `blocked_reason`.
 
 `assumptions` are inferences the evidence supports but does not state
 `unresolved` is what you could not determine.

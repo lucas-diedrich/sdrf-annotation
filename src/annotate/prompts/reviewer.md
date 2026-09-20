@@ -61,13 +61,15 @@ nothing after it:
   "schema_version": "1.0.0",
   "role": "reviewer",
   "accession": "{{ACCESSION}}",
-  "artifacts": [{"path": "sdrf/{{ACCESSION}}.sdrf.tsv", "sha256": "<64 hex chars>"}],
+  "artifacts": [
+    { "path": "sdrf/{{ACCESSION}}.sdrf.tsv", "sha256": "<64 hex chars>" }
+  ],
   "verdict": "pass",
   "blocked_reason": null,
   "deterministic": [
-    {"check": "parse_sdrf", "templates": ["ms-proteomics"], "passed": true},
-    {"check": "tools check", "passed": true},
-    {"check": "tools score", "score": 87}
+    { "check": "parse_sdrf", "templates": ["ms-proteomics"], "passed": true },
+    { "check": "tools check", "passed": true },
+    { "check": "tools score", "score": 87 }
   ],
   "findings": [
     {
@@ -80,7 +82,7 @@ nothing after it:
       "recommendation": "MONDO:0005061"
     }
   ],
-  "literature_agreement": {"reviewed": ["35695565"], "contradictions": []}
+  "literature_agreement": { "reviewed": ["35695565"], "contradictions": [] }
 }
 ```
 
