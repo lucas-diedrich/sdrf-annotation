@@ -666,7 +666,8 @@ class TestSeedSelection:
         self, work, config, fake_agent
     ):
         """A dataset the seed marks annotated must still be resumable."""
-        fake_agent([(Step.CREATOR, creator_ok())])
+        # 137 leaves the dataset started but unfinished
+        fake_agent([(Step.CREATOR, creator_ok())], exit_code=137)
         pipeline.process_dataset(work, "PXD000002", "Already annotated", config)
 
         selected = pipeline.select_datasets(config)
@@ -676,7 +677,8 @@ class TestSeedSelection:
     def test_resumed_in_progress_dataset_keeps_its_seed_title(
         self, work, config, fake_agent
     ):
-        fake_agent([(Step.CREATOR, creator_ok())])
+        # 137 leaves the dataset started but unfinished
+        fake_agent([(Step.CREATOR, creator_ok())], exit_code=137)
         pipeline.process_dataset(work, "PXD000002", "Already annotated", config)
 
         selected = {r.accession: r.title for r in pipeline.select_datasets(config)}
@@ -906,17 +908,31 @@ class TestReviewerDispatch:
         assert agent.calls == [Step.CREATOR]
         assert not (DatasetPaths(work, ACC).status(Step.REVIEWER)).exists()
 
-    def test_a_created_dataset_dispatches_the_reviewer(self, work, config, fake_agent):
-        fake_agent([(Step.CREATOR, creator_ok())])
-        rollup = pipeline.process_dataset(work, ACC, "t", config)
-        # Force the creator run to look complete but unreviewed.
-        assert pipeline._next_step(rollup) is not None
+    @pytest.mark.parametrize(
+        "state,expected",
+        [
+            (State.PENDING, Step.CREATOR),
+            (State.CREATING, Step.CREATOR),
+            (State.REVIEWED_FAIL, Step.CREATOR),
+            (State.CREATED, Step.REVIEWER),
+            (State.REVIEWING, Step.REVIEWER),
+            (State.REVIEWED_PASS, None),
+            (State.BLOCKED, None),
+        ],
+    )
+    def test_next_step_per_state(self, state, expected):
+        from annotate.models import DatasetRollup
 
-        agent = fake_agent([(Step.REVIEWER, reviewer("pass"))])
-        resumed = pipeline.process_dataset(work, ACC, "t", config)
+        assert pipeline._next_step(DatasetRollup(accession=ACC, state=state)) is expected
 
-        assert agent.calls == [Step.REVIEWER]
-        assert resumed.state is State.REVIEWED_PASS
+    def test_a_retryable_failure_re_enters_at_the_step_that_failed(self):
+        from annotate.models import DatasetRollup
+
+        rollup = DatasetRollup(
+            accession=ACC, state=State.FAILED_CONTRACT, failed_step=Step.REVIEWER
+        )
+
+        assert pipeline._next_step(rollup) is Step.REVIEWER
 
     def test_over_listed_evidence_no_longer_blocks_the_reviewer(
         self, work, config, fake_agent
