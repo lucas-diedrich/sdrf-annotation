@@ -108,6 +108,10 @@ watch -n 60 "annotate status --work sdrf-annotations/"
 # Afterwards: retry infrastructure failures, then contract failures
 annotate retry --work sdrf-annotations/ --state failed_infra
 annotate retry --work sdrf-annotations/ --state failed_contract
+
+# Then analyse the batch: what failed, what it cost, what the format could not express
+annotate report --work sdrf-annotations/
+annotate costs  --work sdrf-annotations/
 ```
 
 Budget before starting. Peak disk is `concurrency × (raw budget + 106 MB plugin
@@ -124,9 +128,13 @@ sdrf-annotations/
   PXD012345/
     sdrf/                   # the deliverable
     files/                  # literature + sources.json
+    review/                 # the reviewer's report; the only dir it can write
+      PXD012345.review.json
+      attempt-1/            # superseded reports, rotated on repair
     raw/                    # raw MS files, purged at a terminal state
     logs/                   # never mounted into any container
-      status.json           # dataset rollup + state machine
+      status.json           # dataset rollup + state machine (derived)
+      events.jsonl          # append-only event log; never rewritten
       creator/
         session.jsonl       # the full agent trace
         status.json         # host-written run record (authoritative)
@@ -142,9 +150,6 @@ sdrf-annotations/
         stderr.log
         attempt-1/          # previous attempts, rotated on repair
 ```
-
-Only the per-run `status.json` files are authoritative. Both rollups are derived
-from them, so a corrupted rollup is always regenerable with `annotate rollup`.
 
 ## References
 
