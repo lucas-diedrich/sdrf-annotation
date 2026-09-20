@@ -14,3 +14,7 @@ __pycache__/
 
 # Workflow output
 work/
+*.egg-info/
+build/
+dist/
+.ruff_cache/
