@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "annotate"
+version = "0.0.1"
+description = "Two-agent SDRF auto-annotation pipeline over PRIDE accessions"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+
+# Deliberately minimal. The pipeline shells out to `docker run` and hashes
+# artifacts itself, so it needs no docker SDK and no HTTP client: everything
+# that talks to PRIDE, OLS or PubMed runs inside the container.
+dependencies = [
+    # Validates the agents' JSON output against the creator/reviewer schemas.
+    # This is what separates a `failed_contract` run (agent emitted unparseable
+    # or off-schema JSON) from `failed_infra` (container crashed) -- the two
+    # need different fixes, so the distinction has to be mechanical rather than
+    # guessed from an exit code.
+    "jsonschema>=4.21",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.scripts]
+annotate = "annotate.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+annotate = ["prompts/*.md", "schemas/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 90
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
