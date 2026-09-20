@@ -649,6 +649,49 @@ class TestSeedSelection:
 
         assert [row.accession for row in selected] == ["PXD999999"]
 
+    def test_explicit_accession_overrides_the_annotated_flag(self, config):
+        """Regression: the filter dropped the row, and it came back title-less."""
+        selected = pipeline.select_datasets(config.replace(accessions=("PXD000002",)))
+
+        assert [(r.accession, r.title) for r in selected] == [
+            ("PXD000002", "Already annotated")
+        ]
+
+    def test_explicit_accessions_are_deduplicated(self, config):
+        selected = pipeline.select_datasets(config.replace(accessions=(ACC, ACC)))
+
+        assert [row.accession for row in selected] == [ACC]
+
+    def test_in_progress_work_is_reachable_from_a_plain_run(
+        self, work, config, fake_agent
+    ):
+        """A dataset the seed marks annotated must still be resumable."""
+        fake_agent([(Step.CREATOR, creator_ok())])
+        pipeline.process_dataset(work, "PXD000002", "Already annotated", config)
+
+        selected = pipeline.select_datasets(config)
+
+        assert "PXD000002" in {row.accession for row in selected}
+
+    def test_resumed_in_progress_dataset_keeps_its_seed_title(
+        self, work, config, fake_agent
+    ):
+        fake_agent([(Step.CREATOR, creator_ok())])
+        pipeline.process_dataset(work, "PXD000002", "Already annotated", config)
+
+        selected = {r.accession: r.title for r in pipeline.select_datasets(config)}
+
+        assert selected["PXD000002"] == "Already annotated"
+
+    def test_finished_annotated_datasets_stay_out(self, work, config, fake_agent):
+        fake_agent([(Step.CREATOR, creator_ok()), (Step.REVIEWER, reviewer("pass"))])
+        pipeline.process_dataset(work, "PXD000002", "Already annotated", config)
+
+        assert "PXD000002" not in {r.accession for r in pipeline.select_datasets(config)}
+
+    def test_untouched_annotated_datasets_stay_out(self, config):
+        assert "PXD000002" not in {r.accession for r in pipeline.select_datasets(config)}
+
     def test_limit_truncates(self, config):
         selected = pipeline.select_datasets(
             config.replace(include_annotated=True, limit=1)
@@ -849,3 +892,69 @@ class TestAuthentication:
         summary = pipeline.workflow_rollup(work)
 
         assert "authentication failed" in summary["datasets"][ACC]["last_detail"]
+
+
+class TestReviewerDispatch:
+    """Why the reviewer never ran on PXD038699: the creator run was judged failed."""
+
+    def test_a_failed_creator_stops_before_the_reviewer(self, work, config, fake_agent):
+        agent = fake_agent([(Step.CREATOR, lambda paths: "no json here")])
+
+        rollup = pipeline.process_dataset(work, ACC, "t", config)
+
+        assert rollup.state is State.FAILED_CONTRACT
+        assert agent.calls == [Step.CREATOR]
+        assert not (DatasetPaths(work, ACC).status(Step.REVIEWER)).exists()
+
+    def test_a_created_dataset_dispatches_the_reviewer(self, work, config, fake_agent):
+        fake_agent([(Step.CREATOR, creator_ok())])
+        rollup = pipeline.process_dataset(work, ACC, "t", config)
+        # Force the creator run to look complete but unreviewed.
+        assert pipeline._next_step(rollup) is not None
+
+        agent = fake_agent([(Step.REVIEWER, reviewer("pass"))])
+        resumed = pipeline.process_dataset(work, ACC, "t", config)
+
+        assert agent.calls == [Step.REVIEWER]
+        assert resumed.state is State.REVIEWED_PASS
+
+    def test_over_listed_evidence_no_longer_blocks_the_reviewer(
+        self, work, config, fake_agent
+    ):
+        """The exact PXD038699 payload shape: SDRF plus files/ evidence."""
+
+        def over_listing_creator(paths):
+            (paths.sdrf / f"{ACC}.sdrf.tsv").write_text(DEFAULT_SDRF)
+            payload = {
+                "schema_version": "1.0.0",
+                "role": "creator",
+                "accession": ACC,
+                "outcome": "completed",
+                "blocked_reason": None,
+                "assumptions": [],
+                "unresolved": [],
+                "artifacts": [f"sdrf/{ACC}.sdrf.tsv", "files/sources.json"],
+            }
+            return f"```json\n{json.dumps(payload)}\n```"
+
+        agent = fake_agent(
+            [
+                (Step.CREATOR, over_listing_creator),
+                (Step.REVIEWER, reviewer("pass")),
+            ]
+        )
+
+        rollup = pipeline.process_dataset(work, ACC, "t", config)
+
+        assert agent.calls == [Step.CREATOR, Step.REVIEWER]
+        assert rollup.state is State.REVIEWED_PASS
+
+
+class TestAnnotationToolGuidance:
+    def test_both_prompts_carry_the_correction(self):
+        from annotate import prompts
+
+        for step in Step:
+            prompt = (prompts.PROMPT_DIR / f"{step}.md").read_text()
+            assert "manual curation" in prompt
+            assert "NT=sdrf-skills;VV=" in prompt
