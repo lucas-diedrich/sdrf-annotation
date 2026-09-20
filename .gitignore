@@ -21,3 +21,9 @@ dist/
 
 # Node
 node_modules/
+
+# Agentic Development
+PLAN*.md
+
+# Datasets
+sdrf-annotations
