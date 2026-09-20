@@ -2,7 +2,7 @@
 
 Parallelizable auto-annotation workflow of proteomics datasets with SDRF files. Implemented as a containerized, creator/reviewer two-agent pipeline.
 
-> ![Warning]
+> [!Warning]
 > This workflow was generated with Claude Opus 5. See DESIGN.md for an overview over the package.
 
 ## Setup
