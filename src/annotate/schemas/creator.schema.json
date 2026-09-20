@@ -4,7 +4,7 @@
   "title": "SDRF creator agent output contract",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "role", "accession", "outcome", "artifacts"],
+  "required": ["schema_version", "role", "accession", "outcome", "sdrf_files"],
   "properties": {
     "schema_version": {
       "const": "1.0.0"
@@ -34,13 +34,13 @@
         "type": "string"
       }
     },
-    "artifacts": {
+    "sdrf_files": {
       "type": "array",
       "items": {
         "type": "string",
         "pattern": "^sdrf/[^/]+\\.sdrf\\.tsv$"
       },
-      "description": "Workspace-relative paths only. The host hashes them itself; an agent-computed hash of its own output proves nothing."
+      "description": "The SDRF files written, and nothing else. Evidence under files/ is not listed here. The host hashes the disk itself, so this is a cross-check, not the source of truth."
     },
     "raw_files": {
       "type": "object",
@@ -72,7 +72,7 @@
       },
       "then": {
         "properties": {
-          "artifacts": {
+          "sdrf_files": {
             "minItems": 1
           }
         }
