@@ -1,29 +1,34 @@
 # Review {{ACCESSION}}
 
-Independently falsify the SDRF in `sdrf/` for **{{ACCESSION}}** — {{TITLE}}.
+Independently falsify the SDRF files in `sdrf/` for **{{ACCESSION}}** — {{TITLE}}.
 
 Run `/sdrf-skills:sdrf-adversarial-review` and follow it. This prompt only
-covers what sits on top of that skill and where the skills are wrong.
+covers what sits on top of that skill.
 
-You are a fresh context with no access to the creator's transcript or reasoning.
-`sdrf/`, `files/` and `raw/` are mounted read-only: you cannot edit the SDRF and
-must not try. Return findings; repair is the creator's job. Do not run
+Return findings; repair is the creator's job. Do not run
 `review_gate.py approve` — there is no git worktree here, so the gate cannot
 work; the hash echo below replaces it.
 
-## Emphasis
+## Project Structure
 
-Re-running the validators on a file the creator already validated will almost
-always pass. Run them as a regression guard, but do not mistake a green
-validator for a review.
+`review/` is the only directory you can write to. Everything else is read-only:
+do not try to edit it.
 
-The substance is **the literature read against the annotation**: disease and
-organism terms, strain, sex, treatment and dose, chemistry, instrument,
-acquisition method, label scheme, and sample-to-file mapping. Flag any per-row
-value whose granularity exceeds its evidence — a Methods sentence about the
-cohort does not license a per-sample value. Read `files/` rather than
-re-fetching the creator's literature, but do re-fetch the PRIDE file list and
-project record: they are cheap, and a wrong file mapping turns on them.
+```
+sdrf/
+  SDRF files
+files/
+  Text files that are associated with the metadata annotations in the SDRF files
+raw/
+  Raw mass spectrometry files that are associated with the metadata annotations in the SDRF files
+review/
+  Yours. Write the review contract's report JSON to review/{{ACCESSION}}.review.json
+  -- that exact path -- and its evidence manifest beside it.
+```
+
+Write the report on **every** verdict, not only a pass: a rejection is the
+report worth keeping. The JSON block at the end of this prompt is the host's
+channel and is separate from the report; neither replaces the other.
 
 ## Where the skills are wrong
 
@@ -35,10 +40,11 @@ pattern-validated free text with no controlled vocabulary — there is no
 ontology term for an agent or LLM to prefer instead.
 
 `parse_sdrf` 0.1.6 validates against the **union** of all `--template` values,
-not the last one — `CLAUDE.md` invariant #7 describes superseded behaviour. A
-multi-template artifact must be split by declared template and each subset
-validated against its own single `--template`. Derive the active templates from
-`comment[sdrf template]` in the file, not from anything the creator asserts.
+not the last one — `CLAUDE.md` invariant #7 describes superseded behaviour. For
+a file whose rows all declare the same templates that union is correct: pass
+them together. Split only where rows declare different template sets. Derive
+the active templates from the file's `comment[sdrf template]` columns — the
+column is repeated, once per template — not from anything the creator asserts.
 
 Pass `--use_ols_cache_only` while iterating; the ontology cache is baked into
 this image. Do one final run without it.
