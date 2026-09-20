@@ -7,3 +7,10 @@ claude_credentials_setup
 # Data
 *.csv
 *.tsv
+
+# Python
+__pycache__/
+.pytest_cache/
+
+# Workflow output
+work/
