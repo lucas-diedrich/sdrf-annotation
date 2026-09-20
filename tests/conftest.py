@@ -16,6 +16,31 @@ from annotate import runner
 from annotate.models import DatasetPaths, RunConfig, RunResult, Step
 
 
+@pytest.fixture(autouse=True)
+def no_docker(monkeypatch):
+    """Stub the two host-side docker calls a run makes besides the agent.
+
+    Provenance and specification validation both start a container. Left
+    unstubbed they would make the whole suite depend on a built image, and
+    turn a sub-second run into minutes.
+    """
+    monkeypatch.setattr(
+        "annotate.runner.image_provenance",
+        lambda image: {"image": image, "image_id": "sha256:test", "skills_version": "0"},
+    )
+    monkeypatch.setattr(
+        "annotate.runner.validate_sdrf",
+        lambda sdrf_file, templates, config: {
+            "templates": templates,
+            "ran": True,
+            "passed": True,
+            "errors": 0,
+            "warnings": 0,
+            "detail": "",
+        },
+    )
+
+
 @pytest.fixture
 def work(tmp_path: Path) -> Path:
     root = tmp_path / "work"

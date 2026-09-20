@@ -572,22 +572,46 @@ class TestRawLifecycle:
 
 
 class TestMounts:
+    @staticmethod
+    def _mounts(step, paths, config) -> dict[str, bool]:
+        """{container path: is read-only} for every dataset mount."""
+        command = runner.build_docker_command(step, paths, "prompt", "sid", config)
+        found = {}
+        for arg in command:
+            if arg.startswith(str(paths.root)) and "/workspace/" in arg:
+                host, _, target = arg.partition(":/workspace/")
+                name, _, mode = target.partition(":")
+                found[name] = mode == "ro"
+        return found
+
     @pytest.mark.parametrize(
         "step,expected_ro", [(Step.CREATOR, False), (Step.REVIEWER, True)]
     )
-    def test_reviewer_data_mounts_are_read_only(self, work, config, step, expected_ro):
+    def test_the_reviewer_cannot_write_the_deliverables(
+        self, work, config, step, expected_ro
+    ):
         paths = DatasetPaths(work, ACC)
         paths.scaffold()
 
-        command = runner.build_docker_command(step, paths, "prompt", "sid", config)
-        data_mounts = [
-            arg
-            for arg in command
-            if arg.startswith(str(paths.root)) and "/workspace/" in arg
-        ]
+        mounts = self._mounts(step, paths, config)
 
-        assert len(data_mounts) == 3
-        assert all(mount.endswith(":ro") == expected_ro for mount in data_mounts)
+        assert {name: mounts[name] for name in ("sdrf", "files", "raw")} == {
+            "sdrf": expected_ro,
+            "files": expected_ro,
+            "raw": expected_ro,
+        }
+
+    @pytest.mark.parametrize(
+        "step,expected_ro", [(Step.CREATOR, True), (Step.REVIEWER, False)]
+    )
+    def test_only_the_reviewer_can_write_its_report(
+        self, work, config, step, expected_ro
+    ):
+        """Inverted deliberately: neither agent may edit the other's output."""
+        paths = DatasetPaths(work, ACC)
+        paths.scaffold()
+
+        assert self._mounts(step, paths, config)["review"] is expected_ro
 
     def test_logs_are_never_mounted(self, work, config):
         paths = DatasetPaths(work, ACC)
@@ -860,7 +884,7 @@ class TestAuthentication:
             stdout = stream.read_text().splitlines(keepends=True)
 
         with (tmp_path / "session.jsonl").open("w") as log:
-            _, _, auth_failed = runner._consume_stream(FakeProcess(), log)
+            _, _, auth_failed, _ = runner._consume_stream(FakeProcess(), log)
 
         assert auth_failed
 
