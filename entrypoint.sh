@@ -111,10 +111,28 @@ if [ -d "$CFG" ]; then
 fi
 
 # Don't recursively chown workspace - files created by the container will automatically
-# have the correct ownership since we're running as USER_UID:USER_GID
-# Only ensure the directory itself is accessible
+# have the correct ownership since we're running as USER_UID:USER_GID.
+#
+# chmod alone was not enough: /workspace is created root-owned in the image, so
+# the runtime user could not create scratchpad/ under it and relocated its work
+# to $HOME, outside every mount. Chown the container-layer directories
+# themselves -- never -R, which would rewrite ownership of the host files
+# visible through the bind mounts.
 if [ -d /workspace ]; then
     chmod 755 /workspace 2>/dev/null || true
+    mkdir -p /workspace/scratchpad
+    chown "$USER_UID:$USER_GID" /workspace /workspace/scratchpad 2>/dev/null || true
+fi
+
+# gosu does not reset HOME, and the node base image hardcodes HOME=/home/node,
+# owned by uid 1000. Any other runtime UID then has an unwritable $HOME, and
+# every ~/.cache write (pooch, pip, gh) fails with a misleading error rather
+# than a permission one. Point HOME at the runtime user's own home.
+USER_HOME=$(getent passwd "$USER_NAME" | cut -d: -f6)
+if [ -n "$USER_HOME" ]; then
+    mkdir -p "$USER_HOME" 2>/dev/null || true
+    chown "$USER_UID:$USER_GID" "$USER_HOME" 2>/dev/null || true
+    export HOME="$USER_HOME"
 fi
 
 # Switch to the user and execute the command
