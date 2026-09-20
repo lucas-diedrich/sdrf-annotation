@@ -13,7 +13,12 @@ from pathlib import Path
 from typing import Any
 
 from annotate import prompts, runner
-from annotate.contracts import check_agent_artifacts, hash_artifacts, validate_contract
+from annotate.contracts import (
+    check_agent_artifacts,
+    hash_artifacts,
+    normalize,
+    validate_contract,
+)
 from annotate.models import (
     RETRYABLE_STATES,
     SCHEMA_VERSION,
@@ -92,6 +97,23 @@ def apply_event(
     return rollup
 
 
+def revalidate(run: RunStatus, paths: DatasetPaths) -> Contract:
+    """Re-judge a stored run against the current contract logic.
+
+    The run status keeps the agent's raw output, so the contract verdict is
+    derivable rather than historical. That makes a fix to the contract layer
+    retroactive: a run wrongly rejected by an older rule is recovered by
+    `annotate rollup`, instead of costing a fresh -- and expensive -- agent run.
+    """
+    if not run.agent_output:
+        return run.contract
+    payload = normalize(run.step, run.agent_output)
+    if error := validate_contract(payload, run.step):
+        return Contract(valid=False, error=error)
+    error, _ = check_agent_artifacts(run.step, payload, hash_artifacts(paths.sdrf))
+    return Contract(valid=error is None, error=error)
+
+
 def derive_rollup(paths: DatasetPaths, max_repair: int) -> DatasetRollup:
     """Rebuild a dataset rollup from the authoritative per-run status files.
 
@@ -114,6 +136,7 @@ def derive_rollup(paths: DatasetPaths, max_repair: int) -> DatasetRollup:
     if creator is None:
         return rollup
     creator_run = RunStatus.from_dict(creator)
+    creator_run.contract = revalidate(creator_run, paths)
     if not creator_run.contract.valid:
         rollup.state = (
             State.FAILED_CONTRACT if creator_run.exit_code == 0 else State.FAILED_INFRA
@@ -137,6 +160,7 @@ def derive_rollup(paths: DatasetPaths, max_repair: int) -> DatasetRollup:
     reviewer_run = RunStatus.from_dict(reviewer)
     if reviewer_run.attempt != creator_run.attempt:
         return rollup
+    reviewer_run.contract = revalidate(reviewer_run, paths)
     if not reviewer_run.contract.valid:
         rollup.state = (
             State.FAILED_CONTRACT if reviewer_run.exit_code == 0 else State.FAILED_INFRA
@@ -175,11 +199,16 @@ def workflow_rollup(work: Path) -> dict[str, Any]:
             "attempts": rollup.attempts,
             "updated": rollup.updated,
             "blocked_reason": rollup.blocked_reason,
-            # Why the dataset is where it is. Without this an auth failure reads
-            # as a bare `failed_infra` and the cause stays buried in the trace.
+            # Why the dataset is stuck. Without this an auth failure reads as a
+            # bare `failed_infra` and the cause stays buried in the trace. Only
+            # shown for states that need explaining: history outlives a
+            # re-derivation, so a healthy dataset would otherwise carry the
+            # detail of a failure it has since recovered from.
             "last_detail": next(
                 (e.detail for e in reversed(rollup.history) if e.detail), None
-            ),
+            )
+            if rollup.is_retryable or rollup.state is State.BLOCKED
+            else None,
         }
     counts: dict[str, int] = {}
     for entry in datasets.values():
@@ -193,6 +222,19 @@ def workflow_rollup(work: Path) -> dict[str, Any]:
     }
 
 
+def _persist_revalidated_runs(paths: DatasetPaths) -> None:
+    """Write back any run whose contract verdict changed under current logic."""
+    for step in Step:
+        stored = read_json(paths.status(step))
+        if not stored:
+            continue
+        run = RunStatus.from_dict(stored)
+        verdict = revalidate(run, paths)
+        if verdict.to_dict() != run.contract.to_dict():
+            run.contract = verdict
+            write_json(paths.status(step), run.to_dict())
+
+
 def rebuild_rollups(work: Path, max_repair: int) -> int:
     """Regenerate every rollup from the per-run statuses.
 
@@ -202,6 +244,7 @@ def rebuild_rollups(work: Path, max_repair: int) -> int:
     rebuilt = 0
     for logs_dir in sorted(work.glob("*/logs")):
         paths = DatasetPaths(work, logs_dir.parent.name)
+        _persist_revalidated_runs(paths)
         derived = derive_rollup(paths, max_repair)
         if existing := read_json(paths.rollup):
             previous = DatasetRollup.from_dict(existing)
@@ -294,6 +337,7 @@ def write_run_status(
     contract_error: str | None,
     artifacts: dict[str, str],
     started: str,
+    notes: list[str] | None = None,
 ) -> RunStatus:
     """Persist the host's record of one run. This is the authoritative artifact."""
     status = RunStatus(
@@ -313,6 +357,7 @@ def write_run_status(
         artifacts=[{"path": p, "sha256": h} for p, h in sorted(artifacts.items())],
         usage=run.usage,
         contract=Contract(valid=contract_error is None, error=contract_error),
+        notes=notes or [],
         agent_output=payload or {},
     )
     write_json(paths.status(step), status.to_dict())
@@ -423,15 +468,20 @@ def run_step(
     run = runner.run_agent(step, paths, prompt, config)
 
     payload, parse_error = extract_last_json_object(run.final_text)
+    if payload is not None:
+        payload = normalize(step, payload)
     contract_error = parse_error or (
         validate_contract(payload, step) if payload else None
     )
     on_disk = hash_artifacts(paths.sdrf)
+    notes: list[str] = []
     if contract_error is None and payload is not None:
-        contract_error = check_agent_artifacts(step, payload, on_disk)
+        contract_error, notes = check_agent_artifacts(step, payload, on_disk)
 
     runner.prune_config_dir(paths, step)
-    write_run_status(paths, step, attempt, run, payload, contract_error, on_disk, started)
+    write_run_status(
+        paths, step, attempt, run, payload, contract_error, on_disk, started, notes
+    )
 
     # A disk breach is checked first: the run was killed, so it has no usable
     # output, and the cause is known precisely enough not to call it infra.
@@ -565,22 +615,52 @@ def read_seed(path: Path) -> list[SeedRow]:
     ]
 
 
+def datasets_in_progress(work: Path) -> set[str]:
+    """Accessions under `work` that have started but not finished.
+
+    Work already under way must stay reachable even when the seed marks the
+    dataset as annotated, or a run interrupted mid-flight becomes unresumable
+    without naming it explicitly.
+    """
+    started: set[str] = set()
+    for rollup_path in sorted(work.glob("*/logs/status.json")):
+        data = read_json(rollup_path)
+        if not data:
+            continue
+        rollup = DatasetRollup.from_dict(data)
+        if rollup.state is not State.PENDING and not rollup.is_terminal:
+            started.add(rollup.accession)
+    return started
+
+
 def select_datasets(config: RunConfig) -> list[SeedRow]:
     """Resolve the config's filters to the datasets this run should touch.
 
-    With no `--state` filter, terminal datasets drop out, which is what makes
-    a re-run resume rather than redo.
+    With no `--state` filter, terminal datasets drop out, which is what makes a
+    re-run resume rather than redo.
     """
-    rows = read_seed(config.seed) if config.seed.exists() else []
-    if not config.include_annotated:
-        rows = [row for row in rows if not row.annotated]
+    seed_rows = read_seed(config.seed) if config.seed.exists() else []
+    by_accession = {row.accession: row for row in seed_rows}
+
     if config.accessions:
-        wanted = set(config.accessions)
-        rows = [row for row in rows if row.accession in wanted]
-        # An accession absent from the seed is still runnable: the seed is a
-        # convenience list, not the set of legal inputs.
-        missing = wanted - {row.accession for row in rows}
-        rows += [SeedRow(accession) for accession in sorted(missing)]
+        # An explicit request overrides the seed's `annotated` flag rather than
+        # being filtered out and re-added bare, which silently dropped the
+        # title and sent the agent "(no title in seed)". An accession absent
+        # from the seed is still runnable: the seed is a convenience list, not
+        # the set of legal inputs.
+        candidates = [
+            by_accession.get(accession, SeedRow(accession))
+            for accession in dict.fromkeys(config.accessions)
+        ]
+    else:
+        candidates = [
+            row for row in seed_rows if config.include_annotated or not row.annotated
+        ]
+        known = {row.accession for row in candidates}
+        candidates += [
+            by_accession.get(accession, SeedRow(accession))
+            for accession in sorted(datasets_in_progress(config.work) - known)
+        ]
 
     wanted_states = set(config.states)
 
@@ -590,7 +670,7 @@ def select_datasets(config: RunConfig) -> list[SeedRow]:
             return state in wanted_states
         return state not in TERMINAL_STATES
 
-    rows = [row for row in rows if selected(row)]
+    rows = [row for row in candidates if selected(row)]
     return rows[: config.limit] if config.limit else rows
 
 

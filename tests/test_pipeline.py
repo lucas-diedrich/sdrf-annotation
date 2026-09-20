@@ -26,7 +26,7 @@ def creator_ok(content: str = DEFAULT_SDRF, **extra):
             "blocked_reason": None,
             "assumptions": ["label-free inferred from Methods"],
             "unresolved": [],
-            "artifacts": [f"sdrf/{ACC}.sdrf.tsv"],
+            "sdrf_files": [f"sdrf/{ACC}.sdrf.tsv"],
             "raw_files": {"paths": [], "bytes": 0},
         }
         payload.update(extra)
@@ -45,7 +45,7 @@ def creator_blocked(reason: str):
             "blocked_reason": reason,
             "assumptions": [],
             "unresolved": [],
-            "artifacts": [],
+            "sdrf_files": [],
         }
         return f"```json\n{json.dumps(payload)}\n```"
 

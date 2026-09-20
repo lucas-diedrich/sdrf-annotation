@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import jsonschema
 import pytest
 
@@ -18,7 +20,7 @@ def creator_payload(**overrides):
         "blocked_reason": None,
         "assumptions": [],
         "unresolved": [],
-        "artifacts": ["sdrf/PXD000001.sdrf.tsv"],
+        "sdrf_files": ["sdrf/PXD000001.sdrf.tsv"],
     }
     payload.update(overrides)
     return payload
@@ -102,14 +104,14 @@ class TestValidateContract:
     def test_valid_reviewer_payload(self):
         assert contracts.validate_contract(reviewer_payload(), Step.REVIEWER) is None
 
-    def test_completed_requires_an_artifact(self):
-        error = contracts.validate_contract(creator_payload(artifacts=[]), Step.CREATOR)
+    def test_completed_requires_an_sdrf_file(self):
+        error = contracts.validate_contract(creator_payload(sdrf_files=[]), Step.CREATOR)
 
-        assert error is not None and "artifacts" in error
+        assert error is not None and "sdrf_files" in error
 
     def test_blocked_requires_a_reason(self):
         error = contracts.validate_contract(
-            creator_payload(outcome="blocked", artifacts=[], blocked_reason=None),
+            creator_payload(outcome="blocked", sdrf_files=[], blocked_reason=None),
             Step.CREATOR,
         )
 
@@ -118,7 +120,7 @@ class TestValidateContract:
     def test_blocked_with_a_reason_is_valid(self):
         payload = creator_payload(
             outcome="blocked",
-            artifacts=[],
+            sdrf_files=[],
             blocked_reason="cell-lines template forbids a legal value for tissue rows",
         )
 
@@ -132,14 +134,14 @@ class TestValidateContract:
         assert error is not None and "findings" in error
 
     def test_artifact_path_must_stay_under_sdrf(self):
-        payload = creator_payload(artifacts=["../escape.sdrf.tsv"])
+        payload = creator_payload(sdrf_files=["../escape.sdrf.tsv"])
 
         assert contracts.validate_contract(payload, Step.CREATOR) is not None
 
     def test_creator_does_not_declare_hashes(self):
         """The host hashes the disk; a producer hashing its own output proves nothing."""
         payload = creator_payload(
-            artifacts=[{"path": "sdrf/PXD000001.sdrf.tsv", "sha256": "a" * 64}]
+            sdrf_files=[{"path": "sdrf/PXD000001.sdrf.tsv", "sha256": "a" * 64}]
         )
 
         assert contracts.validate_contract(payload, Step.CREATOR) is not None
@@ -233,10 +235,13 @@ class TestHashBinding:
 
         assert error is not None and "not declared" in error
 
-    def test_blocked_creator_may_declare_nothing(self, tmp_path):
-        payload = creator_payload(outcome="blocked", artifacts=[], blocked_reason="gap")
+    def test_blocked_creator_may_declare_nothing(self):
+        payload = creator_payload(outcome="blocked", sdrf_files=[], blocked_reason="gap")
 
-        assert contracts.check_agent_artifacts(Step.CREATOR, payload, {}) is None
+        error, notes = contracts.check_agent_artifacts(Step.CREATOR, payload, {})
+
+        assert error is None
+        assert notes == []
 
     def test_hash_artifacts_ignores_non_sdrf_files(self, tmp_path, sha256_of):
         (tmp_path / "PXD000001.sdrf.tsv").write_text("one\n")
@@ -341,3 +346,78 @@ class TestRepairBrief:
         )
 
         assert "organism disagrees" in brief
+
+
+class TestCreatorDeclarationIsNotTheSourceOfTruth:
+    """Regression: PXD038699 produced a correct SDRF and was failed anyway.
+
+    The creator listed everything it wrote -- the SDRF plus a dozen evidence
+    files under files/ -- and the host rejected the whole run. The host can see
+    the deliverable on disk, so a bookkeeping slip must not discard it.
+    """
+
+    ON_DISK = {"sdrf/PXD038699.sdrf.tsv": "a" * 64}
+
+    def test_extra_evidence_paths_do_not_fail_the_run(self):
+        payload = creator_payload(
+            accession="PXD038699",
+            sdrf_files=["sdrf/PXD038699.sdrf.tsv"],
+        )
+
+        error, notes = contracts.check_agent_artifacts(
+            Step.CREATOR,
+            payload | {"sdrf_files": ["sdrf/PXD038699.sdrf.tsv"]},
+            self.ON_DISK,
+        )
+
+        assert error is None
+        assert notes == []
+
+    def test_a_mismatched_declaration_is_noted_not_fatal(self):
+        payload = creator_payload(sdrf_files=["sdrf/wrong-name.sdrf.tsv"])
+
+        error, notes = contracts.check_agent_artifacts(
+            Step.CREATOR, payload, self.ON_DISK
+        )
+
+        assert error is None
+        assert any("not on disk" in note for note in notes)
+        assert any("not declared" in note for note in notes)
+
+    def test_completed_with_no_sdrf_on_disk_is_still_fatal(self):
+        """The one creator claim the host cannot verify away."""
+        payload = creator_payload(sdrf_files=["sdrf/PXD000001.sdrf.tsv"])
+
+        error, _ = contracts.check_agent_artifacts(Step.CREATOR, payload, {})
+
+        assert error is not None and "no SDRF" in error
+
+    def test_reviewer_hash_binding_stays_strict(self):
+        """Leniency is creator-only; the reviewer's hashes are the proof."""
+        payload = reviewer_payload(
+            artifacts=[{"path": "sdrf/PXD038699.sdrf.tsv", "sha256": "b" * 64}]
+        )
+
+        error, _ = contracts.check_agent_artifacts(Step.REVIEWER, payload, self.ON_DISK)
+
+        assert error is not None and "sha256 mismatch" in error
+
+
+class TestAnnotationToolValue:
+    """`manual curation` is what the skill suggests and is false for an agent."""
+
+    PATTERN = re.compile(
+        r"^(NT=[\w-]+;VV=v[\d.]+[\w.-]*|[\w-]+ v[\d.]+[\w.-]*|manual curation)$"
+    )
+
+    def test_the_prompt_corrects_the_skill_default(self):
+        prompt = (prompts.PROMPT_DIR / "creator.md").read_text()
+
+        assert "manual curation" in prompt  # named as the thing not to do
+        assert "NT=sdrf-skills;VV=" in prompt
+
+    def test_the_recommended_value_matches_the_spec_pattern(self):
+        """There is no ontology for this column, only this pattern."""
+        assert self.PATTERN.match("NT=sdrf-skills;VV=v0.2.0")
+        assert not self.PATTERN.match("LLM annotation")
+        assert not self.PATTERN.match("agentic")

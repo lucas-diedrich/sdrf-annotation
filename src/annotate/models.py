@@ -291,6 +291,7 @@ class RunStatus:
     artifacts: list[dict[str, str]] = field(default_factory=list)
     usage: dict[str, Any] = field(default_factory=dict)
     contract: Contract = field(default_factory=lambda: Contract(valid=False))
+    notes: list[str] = field(default_factory=list)
     agent_output: dict[str, Any] = field(default_factory=dict)
     schema_version: str = SCHEMA_VERSION
 
@@ -313,6 +314,7 @@ class RunStatus:
             "artifacts": self.artifacts,
             "usage": self.usage,
             "contract": self.contract.to_dict(),
+            "notes": self.notes,
             "agent_output": self.agent_output,
         }
 
@@ -335,6 +337,7 @@ class RunStatus:
             artifacts=data.get("artifacts", []),
             usage=data.get("usage", {}),
             contract=Contract.from_dict(data.get("contract")),
+            notes=data.get("notes", []),
             agent_output=data.get("agent_output", {}),
             schema_version=data.get("schema_version", SCHEMA_VERSION),
         )

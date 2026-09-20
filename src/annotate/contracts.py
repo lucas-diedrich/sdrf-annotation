@@ -26,6 +26,34 @@ def load_schema(role: Step) -> dict[str, Any]:
     return json.loads((SCHEMA_DIR / f"{role}.schema.json").read_text())
 
 
+def normalize(step: Step, payload: dict[str, Any]) -> dict[str, Any]:
+    """Map an older creator payload onto the current contract.
+
+    `sdrf_files` was called `artifacts`, a name agents reasonably read as
+    "everything I produced" -- they listed evidence and scripts under `files/`
+    alongside the SDRF, and the run was rejected for it. Runs recorded under
+    the old name are mapped rather than failed, so a naming fix does not strand
+    a completed annotation, and an agent that still uses it is tolerated. Only
+    SDRF paths survive; the evidence paths the old name invited are dropped.
+
+    Args:
+        step: Which agent produced `payload`.
+        payload: The parsed agent JSON.
+
+    Returns:
+        The payload in the current shape. Unchanged when already current.
+    """
+    if step is not Step.CREATOR or "artifacts" not in payload:
+        return payload
+    migrated = dict(payload)
+    legacy = migrated.pop("artifacts") or []
+    migrated.setdefault(
+        "sdrf_files",
+        [p for p in legacy if isinstance(p, str) and p.startswith("sdrf/")],
+    )
+    return migrated
+
+
 def validate_contract(payload: dict[str, Any], role: Step) -> str | None:
     """Validate an agent payload against its role schema.
 
@@ -117,8 +145,14 @@ def compare_artifacts(
 
 def check_agent_artifacts(
     step: Step, payload: dict[str, Any], on_disk: dict[str, str]
-) -> str | None:
-    """Apply the artifact check appropriate to the agent that ran.
+) -> tuple[str | None, list[str]]:
+    """Cross-examine an agent's artifact claims against the disk.
+
+    The two roles get different treatment because the declaration means
+    different things. For the reviewer it is load-bearing -- the hashes are the
+    only proof of what was judged, so a mismatch voids the verdict. For the
+    creator it is only a cross-check: the host can see the deliverable itself,
+    so a bookkeeping slip must not throw away a good SDRF and a long run.
 
     Args:
         step: Which agent produced `payload`.
@@ -126,12 +160,24 @@ def check_agent_artifacts(
         on_disk: Output of `hash_artifacts`.
 
     Returns:
-        None when the declaration matches disk, otherwise the discrepancy.
+        (error, notes). `error` is fatal; `notes` are recorded discrepancies
+        that do not invalidate the run.
     """
-    declared = payload.get("artifacts", [])
     if step is Step.REVIEWER:
-        return compare_artifacts(declared, on_disk)
-    # A blocked creator legitimately produces nothing.
-    if payload.get("outcome") == "completed" or declared:
-        return compare_paths(declared, on_disk)
-    return None
+        return compare_artifacts(payload.get("artifacts", []), on_disk), []
+
+    declared = payload.get("sdrf_files", [])
+    if payload.get("outcome") == "completed" and not on_disk:
+        return "outcome is 'completed' but no SDRF was written to sdrf/", []
+    return None, _declaration_notes(declared, on_disk)
+
+
+def _declaration_notes(declared: Iterable[str], on_disk: dict[str, str]) -> list[str]:
+    """Describe any disagreement between what was declared and what is on disk."""
+    notes: list[str] = []
+    declared_set = set(declared)
+    if missing := sorted(declared_set - set(on_disk)):
+        notes.append(f"declared but not on disk: {', '.join(missing)}")
+    if undeclared := sorted(set(on_disk) - declared_set):
+        notes.append(f"on disk but not declared: {', '.join(undeclared)}")
+    return notes
