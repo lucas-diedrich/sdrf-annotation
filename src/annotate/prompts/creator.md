@@ -27,6 +27,12 @@ otherwise, and only one per instrument or acquisition method.
 
 ## Where the skills are wrong
 
+`sdrf-annotate` tells you to set `comment[sdrf annotation tool]` to
+`manual curation`. That is false here — this file is produced by an agent, not
+by hand. The column is pattern-validated free text with no controlled
+vocabulary, so name the tool instead: `NT=sdrf-skills;VV=v<plugin version>`,
+taking the version from the installed plugin rather than guessing it.
+
 `parse_sdrf` 0.1.6 validates against the **union** of all `--template` values, so a mixed
 dataset must be split by declared template and each subset validated against its
 own single `--template`.
@@ -64,7 +70,7 @@ End your final message with one fenced ```json block and nothing after it:
     "label-free inferred from absence of TMT reagents in Methods"
   ],
   "unresolved": ["sample->file mapping for 4 runs not determinable"],
-  "artifacts": ["sdrf/{{ACCESSION}}.sdrf.tsv"]
+  "sdrf_files": ["sdrf/{{ACCESSION}}.sdrf.tsv"]
 }
 ```
 
@@ -75,6 +81,9 @@ End your final message with one fenced ```json block and nothing after it:
 - `failed`
 
 `blocked` needs a `blocked_reason`.
+
+`sdrf_files` lists the SDRF files you wrote and **nothing else** — evidence,
+scripts and intermediate tables under `files/` do not belong there.
 
 `assumptions` are inferences the evidence supports but does not state
 `unresolved` is what you could not determine.
