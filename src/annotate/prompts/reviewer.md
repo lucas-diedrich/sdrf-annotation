@@ -27,6 +27,13 @@ project record: they are cheap, and a wrong file mapping turns on them.
 
 ## Where the skills are wrong
 
+`sdrf-annotate` tells the creator to set `comment[sdrf annotation tool]` to
+`manual curation`. That is false for an agent-produced file, so the expected
+value here is `NT=sdrf-skills;VV=v<plugin version>`. Do not raise a finding
+against it, and do not recommend reverting to `manual curation`. The column is
+pattern-validated free text with no controlled vocabulary — there is no
+ontology term for an agent or LLM to prefer instead.
+
 `parse_sdrf` 0.1.6 validates against the **union** of all `--template` values,
 not the last one — `CLAUDE.md` invariant #7 describes superseded behaviour. A
 multi-template artifact must be split by declared template and each subset
