@@ -3,21 +3,26 @@
 FROM node:22-bookworm-slim
 
 
+# poppler-utils supplies pdftoppm, which the Read tool shells out to for PDFs.
+# Without it Read reports PDF support and then fails on every PDF, and
+# supplementary methods -- usually the decisive evidence for an annotation --
+# are unreadable.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git gosu bash python3 python3-pip python3-venv python3-dev \
     build-essential libfreetype6-dev libpng-dev cmake vim curl \
-    ca-certificates gnupg bzip2 \
+    ca-certificates gnupg bzip2 poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
+# Agent should not run gh PRs, so we do not install github
 # gh backs /sdrf-skills:sdrf-contribute, which forks, pushes a branch, and opens
 # the PR against bigbio/sdrf-annotated-datasets via `gh api` / `gh pr create`.
-RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-      -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
- && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
- && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-      > /etc/apt/sources.list.d/github-cli.list \
- && apt-get update && apt-get install -y --no-install-recommends gh \
- && rm -rf /var/lib/apt/lists/*
+# RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+#       -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+#  && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+#  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+#       > /etc/apt/sources.list.d/github-cli.list \
+#  && apt-get update && apt-get install -y --no-install-recommends gh \
+#  && rm -rf /var/lib/apt/lists/*
 
 # Install uv (fast Python package manager) to system-wide location
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
@@ -37,6 +42,20 @@ RUN git clone --recurse-submodules --shallow-submodules --depth 1 \
 # parse_sdrf (from sdrf-pipelines) backs the "validate before presenting" rule.
 RUN uv pip install --python /opt/venv/bin/python -r $SDRF_SKILLS_HOME/requirements.txt
 
+# `--use_ols_cache_only` reads 18 ontology parquet files (39 MB) that ship
+# outside the wheel. Without them the flag RAISES rather than falling back, so
+# every validation would go to live OLS at 2-3 min a run instead of ~3 s.
+#
+# They are baked into the package's local-ontology directory, which
+# get_cache_parquet_files() consults before attempting a download. The pooch
+# user cache is not usable here: it resolves under $HOME, which belongs to a
+# different UID once the entrypoint drops privileges, so the download fails at
+# runtime with "Ensure you have internet connectivity" on a working network.
+RUN ONT_DIR="$(/opt/venv/bin/python -c 'from pathlib import Path; import sdrf_pipelines.ols.ols as ols; print(Path(ols.__file__).resolve().parents[3] / "data" / "ontologies")')" \
+ && mkdir -p "$ONT_DIR" \
+ && /opt/venv/bin/python -c 'import sys, sdrf_pipelines.ols.ols as ols; ols.download_ontology_cache(cache_dir=sys.argv[1])' "$ONT_DIR" \
+ && chmod -R a+rX "$ONT_DIR"
+
 # techsdrf is not on PyPI or any conda channel. Installing straight from git
 # fails: its pyproject declares both a PEP 639 `license = "Apache-2.0"` string
 # and the superseded `License :: OSI Approved` classifier, which setuptools >=77
@@ -46,6 +65,12 @@ RUN git clone --depth 1 https://github.com/bigbio/techsdrf.git /tmp/techsdrf \
  && sed -i '/License :: OSI Approved/d' /tmp/techsdrf/pyproject.toml \
  && uv pip install --python /opt/venv/bin/python /tmp/techsdrf \
  && rm -rf /tmp/techsdrf
+
+# pypdf backs programmatic text extraction (bulk supplementary tables), where
+# the Read tool's page-image path is the wrong tool. It currently arrives
+# transitively via runassessor (a techsdrf dependency); pin it explicitly so a
+# future dependency change cannot silently remove it.
+RUN uv pip install --python /opt/venv/bin/python pypdf
 
 # ThermoRawFileParser gives /sdrf-skills:sdrf-techrefine its Thermo .raw support.
 # Taken from the upstream release rather than bioconda: conda-forge's mono ships
@@ -105,7 +130,12 @@ RUN CLAUDE_CONFIG_DIR=$CLAUDE_SEED claude plugin marketplace add bigbio/sdrf-ski
  && chmod -R a+rX $CLAUDE_SEED
 
 # Create directories
-RUN mkdir -p /.claude /workspace
+# The three data mount points are created here so the paths exist even when a
+# run leaves one unmounted; scratchpad/ is the agent's own working area and is
+# never mounted. Ownership is fixed at runtime by the entrypoint, which knows
+# USER_UID/USER_GID.
+RUN mkdir -p /.claude /workspace /workspace/raw /workspace/sdrf \
+             /workspace/files /workspace/scratchpad
 
 # Copy entrypoint script
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
