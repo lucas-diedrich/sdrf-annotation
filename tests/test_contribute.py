@@ -138,8 +138,23 @@ class TestPullRequestContent:
         message = contribute.commit_message(ACC)
 
         assert message.startswith(f"[contribution] Dataset {ACC}")
-        assert "@MannLabs" in message and "@claude-opus-5" in message
+        assert "@MannLabs" in message
+        assert "`claude-opus-5`" in message
         assert "sdrf-skills" in message
+
+    def test_the_model_is_never_an_at_mention(self):
+        """`claude-opus-5` is not a GitHub account, and `@claude` is a stranger."""
+        message = contribute.commit_message(ACC)
+
+        assert "@claude" not in message
+
+    def test_the_coauthor_trailer_is_the_last_paragraph(self):
+        """Git reads trailers only from the final block."""
+        message = contribute.commit_message(ACC)
+
+        last_paragraph = message.strip().split("\n\n")[-1]
+        assert last_paragraph == contribute.COAUTHOR
+        assert last_paragraph.startswith("Co-Authored-By: Claude Opus 5")
 
     def test_title_names_the_accession(self):
         assert contribute.pr_title(ACC) == f"Add SDRF annotation for {ACC}"
