@@ -30,7 +30,7 @@ def no_docker(monkeypatch):
     )
     monkeypatch.setattr(
         "annotate.runner.validate_sdrf",
-        lambda sdrf_file, templates, config: {
+        lambda sdrf_file, templates, config, use_ols_cache_only=True: {
             "templates": templates,
             "ran": True,
             "passed": True,
