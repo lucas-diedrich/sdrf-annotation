@@ -12,6 +12,7 @@ batch is interrupted.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import tempfile
@@ -37,6 +38,10 @@ MODEL = "claude-opus-5"
 COAUTHOR = "Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 GIT_TIMEOUT_S = 300
 
+PRIDE_PROJECT_URL = "https://www.ebi.ac.uk/pride/archive/projects/{accession}"
+DOI_URL = "https://doi.org/{doi}"
+_DOI = re.compile(r"\b(10\.\d{4,9}/[^\s\"'<>,\]}]+)")
+
 # How many `used_for` entries a cited source shows before it is summarised.
 USED_FOR_SHOWN = 3
 
@@ -53,6 +58,7 @@ class Candidate:
     templates: tuple[str, ...]
     spec_gaps: tuple[tuple[str, str], ...]
     sources: tuple[tuple[str, str, str], ...] = ()
+    doi: str = ""
 
     @property
     def branch(self) -> str:
@@ -169,6 +175,33 @@ def _sources(paths: DatasetPaths) -> tuple[tuple[str, str, str], ...]:
     return tuple(rows)
 
 
+def _doi(paths: DatasetPaths) -> str:
+    """Find the publication DOI for one dataset from the records on disk.
+
+    The PRIDE record is preferred because its `references` are curated per
+    project; `sources.json` is the fallback, since a dataset PRIDE has no
+    reference for may still have been annotated from a paper the creator cited.
+    Both are already on disk, so no lookup is made at contribution time.
+
+    Returns:
+        The bare DOI, or "" when neither record carries one.
+    """
+    for record in sorted(paths.files.glob("*pride*project*.json")):
+        payload = read_json(record) or {}
+        for reference in payload.get("references") or []:
+            if doi := str(reference.get("doi") or "").strip():
+                return doi
+    record = read_json(paths.files / "sources.json") or {}
+    for entry in record.get("sources") or []:
+        if not isinstance(entry, dict):
+            continue
+        urls = [entry.get("url"), *(entry.get("urls") or [])]
+        for url in urls:
+            if url and "doi.org/" in url and (found := _DOI.search(url)):
+                return found.group(1)
+    return ""
+
+
 def _templates(paths: DatasetPaths) -> tuple[str, ...]:
     """The templates the SDRF declares, as the host recorded them."""
     status = read_json(paths.status(Step.REVIEWER)) or {}
@@ -219,6 +252,7 @@ def select_candidates(
                 templates=_templates(paths),
                 spec_gaps=_spec_gaps(paths),
                 sources=_sources(paths),
+                doi=_doi(paths),
             )
         )
         if limit and len(candidates) >= limit:
@@ -280,11 +314,22 @@ def pr_body(candidate: Candidate, live_ols: bool) -> str:
     """
     templates = ", ".join(candidate.templates) or "declared templates"
     title = candidate.title or "(no title in seed)"
+    accession_link = (
+        f"[{candidate.accession}]"
+        f"({PRIDE_PROJECT_URL.format(accession=candidate.accession)})"
+    )
+    # Omitted rather than rendered as "unknown": a reviewer scanning 150 PRs
+    # reads a missing field faster than a placeholder.
+    doi_link = (
+        f" | DOI: [{candidate.doi}]({DOI_URL.format(doi=candidate.doi)})"
+        if candidate.doi
+        else ""
+    )
     lines = [
         f"> This is an automatic PR, generated with the workflow `{WORKFLOW_URL}` "
         "and `sdrf-skills`",
         "",
-        f"Dataset {candidate.accession} | Title: {title}",
+        f"Dataset {accession_link} | Title: {title}{doi_link}",
         "",
         "## Checks",
         "",

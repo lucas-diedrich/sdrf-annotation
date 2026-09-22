@@ -28,6 +28,7 @@ def make_dataset(
     templates=("ms-proteomics", "human"),
     files=(f"{ACC}.sdrf.tsv",),
     sources=None,
+    references=None,
 ):
     """Write the on-disk shape of one finished dataset run."""
     paths = DatasetPaths(work, accession)
@@ -37,6 +38,10 @@ def make_dataset(
     if sources is not None:
         (paths.files / "sources.json").write_text(
             json.dumps({"accession": accession, "sources": sources})
+        )
+    if references is not None:
+        (paths.files / "pride-project.json").write_text(
+            json.dumps({"accession": accession, "doi": "", "references": references})
         )
     (paths.logs / "status.json").write_text(
         json.dumps({"accession": accession, "state": str(state)})
@@ -166,7 +171,10 @@ class TestPullRequestContent:
         body = contribute.pr_body(candidate, live_ols=True)
 
         assert "This is an automatic PR" in body
-        assert f"Dataset {ACC} | Title: A deep proteome" in body
+        assert (
+            f"Dataset [{ACC}](https://www.ebi.ac.uk/pride/archive/projects/{ACC})"
+            " | Title: A deep proteome" in body
+        )
         assert "- [x] `parse_sdrf validate-sdrf` passes (ms-proteomics, human)" in body
         assert "- [x] All accessions verified against live OLS4" in body
         assert "- [x] Independent adversarial review passed" in body
@@ -200,6 +208,70 @@ class TestPullRequestContent:
         [candidate] = contribute.select_candidates(work, {})
 
         assert "Specification gaps" not in contribute.pr_body(candidate, live_ols=True)
+
+    def test_the_accession_links_to_its_pride_page(self, work):
+        make_dataset(work)
+        [candidate] = contribute.select_candidates(work, {})
+
+        body = contribute.pr_body(candidate, live_ols=True)
+
+        assert (
+            f"Dataset [{ACC}](https://www.ebi.ac.uk/pride/archive/projects/{ACC})" in body
+        )
+
+    def test_the_doi_comes_from_the_pride_record_and_is_hyperlinked(self, work):
+        make_dataset(work, references=[{"doi": "10.1016/j.cels.2018.10.012"}])
+        [candidate] = contribute.select_candidates(work, {})
+
+        body = contribute.pr_body(candidate, live_ols=True)
+
+        assert (
+            "| DOI: [10.1016/j.cels.2018.10.012]"
+            "(https://doi.org/10.1016/j.cels.2018.10.012)" in body
+        )
+
+    def test_the_doi_falls_back_to_the_cited_sources(self, work):
+        """PXD062231's PRIDE record carries no references; its sources do."""
+        make_dataset(
+            work,
+            references=[],
+            sources=[
+                {
+                    "id": "publication",
+                    "urls": ["https://doi.org/10.1038/s42255-026-01459-2"],
+                    "used_for": "disease",
+                }
+            ],
+        )
+        [candidate] = contribute.select_candidates(work, {})
+
+        assert candidate.doi == "10.1038/s42255-026-01459-2"
+
+    def test_the_pride_record_wins_over_the_sources(self, work):
+        make_dataset(
+            work,
+            references=[{"doi": "10.1000/curated"}],
+            sources=[
+                {
+                    "id": "publication",
+                    "urls": ["https://doi.org/10.1000/secondhand"],
+                    "used_for": "x",
+                }
+            ],
+        )
+        [candidate] = contribute.select_candidates(work, {})
+
+        assert candidate.doi == "10.1000/curated"
+
+    def test_no_doi_leaves_the_segment_out_entirely(self, work):
+        """A reviewer reads a missing field faster than 'DOI: unknown'."""
+        make_dataset(work)
+        [candidate] = contribute.select_candidates(work, {})
+
+        body = contribute.pr_body(candidate, live_ols=True)
+
+        assert candidate.doi == ""
+        assert "DOI" not in body
 
     def test_sources_are_cited_with_their_location(self, work):
         """The dataset repo asks agentic contributions to cite what they read."""
