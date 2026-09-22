@@ -20,6 +20,7 @@ from annotate.utils import read_json, sha256_file
 
 SCHEMA_DIR = Path(__file__).parent / "schemas"
 SOURCES_FILE = "sources.json"
+SDRF_PREFIX = "sdrf"
 
 # Free text the agent may use where it has no column to name. Counted as one
 # bucket rather than treated as a column that does not exist.
@@ -36,16 +37,23 @@ def load_sources_schema() -> dict[str, Any]:
     return json.loads((SCHEMA_DIR / "sources.schema.json").read_text())
 
 
+def _declared_sdrf(legacy: Iterable[Any]) -> list[Any]:
+    """Keep only the SDRF declarations out of a legacy `artifacts` list.
+
+    Entries are bare paths from the creator and {path, sha256} objects from the
+    reviewer; both roles over-listed the same way, so both are filtered on the
+    path alone and the surviving entries keep their original shape.
+    """
+    kept: list[Any] = []
+    for entry in legacy:
+        path = entry.get("path") if isinstance(entry, dict) else entry
+        if isinstance(path, str) and path.startswith(f"{SDRF_PREFIX}/"):
+            kept.append(entry)
+    return kept
+
+
 def normalize(step: Step, payload: dict[str, Any]) -> dict[str, Any]:
-    """Map an older creator payload onto the current contract.
-
-    `sdrf_files` was called `artifacts`, a name agents reasonably read as
-    "everything I produced" -- they listed evidence and scripts under `files/`
-    alongside the SDRF, and the run was rejected for it. Runs recorded under
-    the old name are mapped rather than failed, so a naming fix does not strand
-    a completed annotation, and an agent that still uses it is tolerated. Only
-    SDRF paths survive; the evidence paths the old name invited are dropped.
-
+    """Map an older agent payload onto the current contract.
     Args:
         step: Which agent produced `payload`.
         payload: The parsed agent JSON.
@@ -53,15 +61,23 @@ def normalize(step: Step, payload: dict[str, Any]) -> dict[str, Any]:
     Returns:
         The payload in the current shape. Unchanged when already current.
     """
-    if step is not Step.CREATOR:
-        return payload
+    # Related to commit: f7c5ab5a24bf9246b35f51f0b377c4a7dfcf3c0c
+    # `sdrf_files` was called `artifacts` in both contracts, a name agents
+    # reasonably read as "everything I produced" -- they listed evidence and
+    # scripts under `files/` alongside the SDRF, and the run was rejected for it
+    # (PXD038699 as creator, PXD000332 as reviewer). Runs recorded under the old
+    # name are mapped rather than failed, so a naming fix does not strand a
+    # completed annotation, and an agent that still uses it is tolerated. Only
+    # SDRF paths survive; the evidence paths the old name invited are dropped.
+    # The reviewer's hashes are untouched by this, so the binding that makes its
+    # verdict trustworthy is neither weakened nor bypassed.
+
     migrated = dict(payload)
     if "artifacts" in migrated:
         legacy = migrated.pop("artifacts") or []
-        migrated.setdefault(
-            "sdrf_files",
-            [p for p in legacy if isinstance(p, str) and p.startswith("sdrf/")],
-        )
+        migrated.setdefault("sdrf_files", _declared_sdrf(legacy))
+    if step is not Step.CREATOR:
+        return migrated
     # `unresolved` was a flat list of sentences, which cannot be counted across
     # datasets. Migrated entries keep the sentence and carry a null column, so
     # an old run stays valid and is simply absent from any per-column tally.
@@ -117,7 +133,7 @@ def compare_paths(declared: Iterable[str], on_disk: dict[str, str]) -> str | Non
     proves nothing, so the host hashes the disk itself.
 
     Args:
-        declared: The creator's `artifacts` list of workspace-relative paths.
+        declared: The creator's `sdrf_files` list of workspace-relative paths.
         on_disk: Output of `hash_artifacts`.
 
     Returns:
@@ -144,7 +160,7 @@ def compare_artifacts(
     content other than the artifact, so the verdict is discarded.
 
     Args:
-        declared: The reviewer's `artifacts` list of {path, sha256}.
+        declared: The reviewer's `sdrf_files` list of {path, sha256}.
         on_disk: Output of `hash_artifacts`.
 
     Returns:
@@ -183,7 +199,7 @@ def check_agent_artifacts(
         that do not invalidate the run.
     """
     if step is Step.REVIEWER:
-        return compare_artifacts(payload.get("artifacts", []), on_disk), []
+        return compare_artifacts(payload.get("sdrf_files", []), on_disk), []
 
     declared = payload.get("sdrf_files", [])
     if payload.get("outcome") == "completed" and not on_disk:
