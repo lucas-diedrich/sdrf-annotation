@@ -64,17 +64,17 @@ the error.
 
 ## Output
 
-Hash every artifact **before** you review it and echo the hashes; the host
-recomputes them and discards your verdict on a mismatch. Review every file in
-`sdrf/`, not a subset. End your final message with one fenced ```json block and
-nothing after it:
+Hash every SDRF in `sdrf/` **before** you review it and echo the hashes; the
+host recomputes them and discards your verdict on a mismatch. Review every file
+in `sdrf/`, not a subset. End your final message with one fenced ```json block
+and nothing after it:
 
 ```json
 {
   "schema_version": "1.0.0",
   "role": "reviewer",
   "accession": "{{ACCESSION}}",
-  "artifacts": [
+  "sdrf_files": [
     { "path": "sdrf/{{ACCESSION}}.sdrf.tsv", "sha256": "<64 hex chars>" }
   ],
   "verdict": "pass",
@@ -98,6 +98,8 @@ nothing after it:
   "literature_agreement": { "reviewed": ["35695565"], "contradictions": [] }
 }
 ```
+
+`sdrf_files` lists the files in `sdrf/` and **nothing else** — evidence, scripts and intermediate tables under `files/` do not belong there, but use these file for review. Every SDRF in `sdrf/` must appear, carrying the hash you reviewed it at.
 
 `deterministic` records every check you actually ran with its real result; never
 report a check you could not run as passing. Every finding needs a precise
