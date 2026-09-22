@@ -31,7 +31,7 @@ def reviewer_payload(**overrides):
         "schema_version": "1.0.0",
         "role": "reviewer",
         "accession": "PXD000001",
-        "artifacts": [{"path": "sdrf/PXD000001.sdrf.tsv", "sha256": "a" * 64}],
+        "sdrf_files": [{"path": "sdrf/PXD000001.sdrf.tsv", "sha256": "a" * 64}],
         "verdict": "pass",
         "deterministic": [{"check": "parse_sdrf", "passed": True}],
         "findings": [],
@@ -275,8 +275,8 @@ class TestSchemasAndPrompts:
 
         assert error is None, error
         if role is Step.REVIEWER:
-            payload["artifacts"] = [
-                dict(entry, sha256="a" * 64) for entry in payload["artifacts"]
+            payload["sdrf_files"] = [
+                dict(entry, sha256="a" * 64) for entry in payload["sdrf_files"]
             ]
         assert contracts.validate_contract(payload, role) is None
 
@@ -395,12 +395,76 @@ class TestCreatorDeclarationIsNotTheSourceOfTruth:
     def test_reviewer_hash_binding_stays_strict(self):
         """Leniency is creator-only; the reviewer's hashes are the proof."""
         payload = reviewer_payload(
-            artifacts=[{"path": "sdrf/PXD038699.sdrf.tsv", "sha256": "b" * 64}]
+            sdrf_files=[{"path": "sdrf/PXD038699.sdrf.tsv", "sha256": "b" * 64}]
         )
 
         error, _ = contracts.check_agent_artifacts(Step.REVIEWER, payload, self.ON_DISK)
 
         assert error is not None and "sha256 mismatch" in error
+
+
+class TestReviewerOverListing:
+    """Regression: PXD000332 produced a sound review and was failed anyway.
+
+    The prompt said "hash every artifact", so the reviewer hashed `sdrf/*` and
+    all thirteen evidence files under `files/` and declared them together. The
+    SDRF entry was correct and its hash matched, but the evidence paths failed
+    the path pattern and the verdict -- two error findings against a real
+    mis-annotation -- was discarded.
+    """
+
+    ACC = "PXD000332"
+    ON_DISK = {f"sdrf/{ACC}.sdrf.tsv": "c" * 64}
+
+    def legacy_payload(self, declared=None):
+        """A reviewer payload under the old field name, as PXD000332 emitted it."""
+        payload = reviewer_payload(accession=self.ACC)
+        del payload["sdrf_files"]
+        payload["artifacts"] = declared or [
+            {"path": f"sdrf/{self.ACC}.sdrf.tsv", "sha256": "c" * 64},
+            {"path": f"files/{self.ACC}.report.md", "sha256": "d" * 64},
+            {"path": "files/sources.json", "sha256": "e" * 64},
+        ]
+        return payload
+
+    def test_evidence_paths_are_dropped_and_the_review_validates(self):
+        payload = contracts.normalize(Step.REVIEWER, self.legacy_payload())
+
+        assert contracts.validate_contract(payload, Step.REVIEWER) is None
+        assert payload["sdrf_files"] == [
+            {"path": f"sdrf/{self.ACC}.sdrf.tsv", "sha256": "c" * 64}
+        ]
+
+    def test_the_surviving_hash_still_binds(self):
+        """Dropping evidence paths must not drop the proof of what was judged."""
+        payload = contracts.normalize(Step.REVIEWER, self.legacy_payload())
+
+        error, _ = contracts.check_agent_artifacts(Step.REVIEWER, payload, self.ON_DISK)
+
+        assert error is None
+
+    def test_a_stale_hash_under_the_old_name_is_still_caught(self):
+        stale = self.legacy_payload()
+        stale["artifacts"][0]["sha256"] = "f" * 64
+        payload = contracts.normalize(Step.REVIEWER, stale)
+
+        error, _ = contracts.check_agent_artifacts(Step.REVIEWER, payload, self.ON_DISK)
+
+        assert error is not None and "sha256 mismatch" in error
+
+    def test_listing_only_evidence_is_still_rejected(self):
+        """Nothing under sdrf/ declared means nothing was proven reviewed."""
+        payload = contracts.normalize(
+            Step.REVIEWER,
+            self.legacy_payload([{"path": "files/sources.json", "sha256": "e" * 64}]),
+        )
+
+        assert contracts.validate_contract(payload, Step.REVIEWER) is not None
+
+    def test_a_current_payload_is_untouched(self):
+        payload = reviewer_payload()
+
+        assert contracts.normalize(Step.REVIEWER, payload) == payload
 
 
 class TestAnnotationToolValue:

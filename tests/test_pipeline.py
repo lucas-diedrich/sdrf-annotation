@@ -58,7 +58,7 @@ def reviewer(verdict: str, findings=None, **extra):
             "schema_version": "1.0.0",
             "role": "reviewer",
             "accession": ACC,
-            "artifacts": [
+            "sdrf_files": [
                 {"path": path, "sha256": digest}
                 for path, digest in sorted(hash_artifacts(paths.sdrf).items())
             ],
@@ -225,7 +225,7 @@ class TestNegativeReview:
         def stale_reviewer(paths):
             body = reviewer("pass")(paths).removeprefix("```json\n").removesuffix("\n```")
             payload = json.loads(body)
-            payload["artifacts"][0]["sha256"] = "b" * 64
+            payload["sdrf_files"][0]["sha256"] = "b" * 64
             return f"```json\n{json.dumps(payload)}\n```"
 
         fake_agent([(Step.CREATOR, creator_ok()), (Step.REVIEWER, stale_reviewer)])
@@ -246,7 +246,7 @@ class TestNegativeReview:
             (paths.sdrf / f"{ACC}-cell-lines.sdrf.tsv").write_text("second template\n")
             body = reviewer("pass")(paths).removeprefix("```json\n").removesuffix("\n```")
             payload = json.loads(body)
-            payload["artifacts"] = [payload["artifacts"][0]]
+            payload["sdrf_files"] = [payload["sdrf_files"][0]]
             return f"```json\n{json.dumps(payload)}\n```"
 
         fake_agent([(Step.CREATOR, creator_ok()), (Step.REVIEWER, partial_reviewer)])
@@ -988,6 +988,28 @@ class TestReviewerDispatch:
 
         assert agent.calls == [Step.CREATOR, Step.REVIEWER]
         assert rollup.state is State.REVIEWED_PASS
+
+    def test_an_over_listing_reviewer_keeps_its_verdict(self, work, config, fake_agent):
+        """The exact PXD000332 payload shape: the SDRF plus files/ evidence."""
+
+        def over_listing_reviewer(paths):
+            body = reviewer("pass")(paths).removeprefix("```json\n").removesuffix("\n```")
+            payload = json.loads(body)
+            payload["artifacts"] = payload.pop("sdrf_files") + [
+                {"path": "files/sources.json", "sha256": "e" * 64}
+            ]
+            return f"```json\n{json.dumps(payload)}\n```"
+
+        agent = fake_agent(
+            [(Step.CREATOR, creator_ok()), (Step.REVIEWER, over_listing_reviewer)]
+        )
+        paths = DatasetPaths(work, ACC)
+
+        rollup = pipeline.process_dataset(work, ACC, "t", config)
+
+        assert agent.calls == [Step.CREATOR, Step.REVIEWER]
+        assert rollup.state is State.REVIEWED_PASS
+        assert read_json(paths.status(Step.REVIEWER))["contract"]["valid"] is True
 
 
 class TestAnnotationToolGuidance:
