@@ -114,10 +114,18 @@ annotate report --work sdrf-annotations/
 annotate costs  --work sdrf-annotations/
 ```
 
-Budget before starting. Peak disk is `concurrency × (raw budget + 106 MB plugin
-cache)`; steady-state disk is the SDRFs, the literature in `files/`, and the
-session traces. Blocked datasets are staged under `sdrf-annotations/sandbox/<ACC>/` with a
-`BLOCKED.md`, matching the upstream CI-exempt convention.
+### Contribute the passing datasets
+
+One pull request per accession, against your fork of the dataset repo.
+
+```bash
+# Dry run: select, validate, render. Pushes nothing. This is the default.
+annotate contribute --work sdrf-annotations/ --repo ../sdrf-annotated-datasets
+
+# Submit a bounded first batch, then everything
+annotate contribute --work sdrf-annotations/ --limit 5 --no-dry-run
+annotate contribute --work sdrf-annotations/ --no-dry-run
+```
 
 ### Results layout
 

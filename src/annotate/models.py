@@ -24,6 +24,8 @@ DEFAULT_RAW_BUDGET_GB = 20.0
 DEFAULT_SCRATCH_GB = 2.0
 DEFAULT_MAX_REPAIR = 2
 DEFAULT_TIMEOUT_S = 5400
+DEFAULT_DATASET_REPO = Path("../sdrf-annotated-datasets")
+DEFAULT_BASE_REPO = "lucas-diedrich/sdrf-annotated-datasets"
 
 # --permission-mode acceptEdits leaves Bash gated, and a gated Bash call in
 # `claude -p` is denied outright -- there is nobody to answer the prompt, so the

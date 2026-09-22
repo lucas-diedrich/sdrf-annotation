@@ -5,6 +5,7 @@
     annotate retry  --work work/ --state failed_infra
     annotate rollup --work work/
     annotate purge  --work work/ --raw
+    annotate contribute --work work/ --repo ../sdrf-annotated-datasets
     annotate doctor
 
 Nothing here resolves paths against the package, so the workflow can be run
@@ -20,8 +21,11 @@ from typing import Annotated, Any
 import typer
 
 from annotate import analysis, pipeline, runner
+from annotate import contribute as contribute_mod
 from annotate.models import (
+    DEFAULT_BASE_REPO,
     DEFAULT_CONCURRENCY,
+    DEFAULT_DATASET_REPO,
     DEFAULT_ENV_FILE,
     DEFAULT_IMAGE,
     DEFAULT_MAX_REPAIR,
@@ -333,6 +337,66 @@ def report(
         f"\nhost-side validation: {validation['passed']} passed, "
         f"{validation['failed']} failed, {validation['not_run']} not run"
     )
+
+
+@app.command()
+def contribute(
+    work: WorkOpt = DEFAULT_WORK,
+    seed: Annotated[Path, typer.Option()] = DEFAULT_SEED,
+    repo: Annotated[
+        Path, typer.Option(help="Local checkout of your dataset-repo fork.")
+    ] = DEFAULT_DATASET_REPO,
+    base_repo: Annotated[
+        str, typer.Option(help="owner/name the pull requests are opened against.")
+    ] = DEFAULT_BASE_REPO,
+    base_branch: Annotated[str, typer.Option()] = "main",
+    accession: Annotated[list[str] | None, typer.Option()] = None,
+    limit: Annotated[
+        int, typer.Option(help="Contribute at most this many datasets. 0 is all.")
+    ] = 0,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            help="Select and validate only. Pass --no-dry-run to push and open PRs."
+        ),
+    ] = True,
+    validate: Annotated[
+        bool, typer.Option(help="Validate against live OLS before contributing.")
+    ] = True,
+    allow_update: Annotated[
+        bool,
+        typer.Option(help="Contribute accessions the repository already annotates."),
+    ] = False,
+    image: Annotated[str, typer.Option()] = DEFAULT_IMAGE,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Open one pull request per reviewed dataset against the dataset repo."""
+    titles = {row.accession: row.title for row in pipeline.read_seed(seed)}
+    report = contribute_mod.contribute(
+        work=work,
+        titles=titles,
+        repo=repo,
+        base_repo=base_repo,
+        base_branch=base_branch,
+        accessions=accession or None,
+        limit=limit,
+        dry_run=dry_run,
+        validate=validate,
+        allow_update=allow_update,
+        config=RunConfig(image=image),
+    )
+    if as_json:
+        typer.echo(json.dumps(report.to_dict(), indent=2))
+    else:
+        if not report.submissions:
+            typer.echo("no dataset at reviewed_pass matched the selection")
+            raise typer.Exit(EXIT_NOTHING_SELECTED)
+        for item in report.submissions:
+            suffix = item.url or item.detail
+            typer.echo(f"  {item.status:<10} {item.accession:<12} {suffix}")
+        if dry_run:
+            typer.echo("\ndry run: nothing pushed. Re-run with --no-dry-run to submit.")
+    raise typer.Exit(EXIT_OK if not report.count("failed") else EXIT_INCOMPLETE)
 
 
 @app.command()

@@ -404,19 +404,54 @@ def image_provenance(image: str) -> dict[str, str]:
     return provenance
 
 
+def validate_command(
+    sdrf_file: Path, templates: list[str], image: str, use_ols_cache_only: bool = True
+) -> list[str]:
+    """Assemble the `docker run` argv for one specification validation.
+
+    Args:
+        sdrf_file: The file to validate. Its parent is mounted read-only.
+        templates: The `--template` values to validate against.
+        image: The image carrying `parse_sdrf`.
+        use_ols_cache_only: Validate offline against the baked ontology cache.
+            False drops both the cache flag and the network isolation, so every
+            term is resolved against live OLS.
+
+    Returns:
+        The full docker argv.
+    """
+    return [
+        "docker", "run", "--rm",
+        *(("--network", "none") if use_ols_cache_only else ()),
+        "-v", f"{sdrf_file.resolve().parent}:/check:ro",
+        image,
+        "parse_sdrf", "validate-sdrf", "-s", f"/check/{sdrf_file.name}",
+        *chain.from_iterable(("-t", name) for name in templates),
+        *(("--use_ols_cache_only",) if use_ols_cache_only else ()),
+    ]  # fmt: skip
+
+
 def validate_sdrf(
-    sdrf_file: Path, templates: list[str], config: RunConfig
+    sdrf_file: Path,
+    templates: list[str],
+    config: RunConfig,
+    use_ols_cache_only: bool = True,
 ) -> dict[str, Any]:
-    """Run the specification validator over one SDRF, offline, in the image.
+    """Run the specification validator over one SDRF in the image.
 
     The host has no `parse_sdrf` of its own, so the check runs in the same
     image the agent used -- which also means it is the same validator version.
-    `--network none` with the baked ontology cache keeps it deterministic.
+    The default is `--network none` with the baked ontology cache, which keeps
+    the pipeline's own bookkeeping deterministic and offline.
 
     Args:
         sdrf_file: The file to validate. Its parent is mounted read-only.
         templates: The `--template` values to validate against.
         config: Run configuration, for the image.
+        use_ols_cache_only: Validate against the baked cache with the network
+            off. False resolves every term against live OLS instead, which is
+            what a contribution's "verified against live OLS4" claim needs and
+            the cached run cannot support.
 
     Returns:
         {templates, ran, passed, errors, warnings, detail}. `ran` is False when
@@ -424,14 +459,7 @@ def validate_sdrf(
         the file.
     """
     result: dict[str, Any] = {"templates": templates, "ran": False, "passed": None}
-    command = [
-        "docker", "run", "--rm", "--network", "none",
-        "-v", f"{sdrf_file.resolve().parent}:/check:ro",
-        config.image,
-        "parse_sdrf", "validate-sdrf", "-s", f"/check/{sdrf_file.name}",
-        *chain.from_iterable(("-t", name) for name in templates),
-        "--use_ols_cache_only",
-    ]  # fmt: skip
+    command = validate_command(sdrf_file, templates, config.image, use_ols_cache_only)
     try:
         probe = subprocess.run(
             command,
