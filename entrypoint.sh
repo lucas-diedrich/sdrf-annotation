@@ -11,6 +11,12 @@ set -e
 USER_UID=${USER_UID:-1000}
 USER_GID=${USER_GID:-1000}
 
+# Pinned rather than left to Claude Code's default, which moves with CLI
+# releases: the model is recorded as the co-author of every contributed SDRF,
+# so it must not change silently between an image rebuild and the next batch.
+# [1m] keeps the long-context window the annotation runs rely on.
+export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-claude-opus-5-5[1m]}"
+
 # Register the plugins and MCP servers baked into the image.
 #
 # The cache is copied (no-clobber) rather than referenced in place: Claude
