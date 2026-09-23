@@ -40,7 +40,10 @@ RUN git clone --recurse-submodules --shallow-submodules --depth 1 \
       https://github.com/bigbio/sdrf-skills.git $SDRF_SKILLS_HOME
 
 # parse_sdrf (from sdrf-pipelines) backs the "validate before presenting" rule.
-RUN uv pip install --python /opt/venv/bin/python -r $SDRF_SKILLS_HOME/requirements.txt
+# Run from the clone: requirements.txt ends in `-e .` (the sdrf-tools console
+# script), which uv resolves against the working directory, not the file.
+RUN cd $SDRF_SKILLS_HOME \
+ && uv pip install --python /opt/venv/bin/python -r requirements.txt
 
 # `--use_ols_cache_only` reads 18 ontology parquet files (39 MB) that ship
 # outside the wheel. Without them the flag RAISES rather than falling back, so
