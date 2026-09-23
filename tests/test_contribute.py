@@ -12,6 +12,7 @@ from annotate import contribute
 from annotate.models import DatasetPaths, State, Step
 
 ACC = "PXD000001"
+BRANCH = f"annotation/mannlabs/{ACC}"
 SDRF = "source name\tassay name\nsample 1\trun 1\n"
 
 
@@ -66,18 +67,30 @@ def make_dataset(
     return paths
 
 
+# A fork checkout with the base repository as a second remote, as `gh repo fork
+# --clone` leaves it.
+REMOTES = (
+    "origin\thttps://github.com/fork/name.git (fetch)\n"
+    "origin\thttps://github.com/fork/name.git (push)\n"
+    "upstream\tgit@github.com:owner/name.git (fetch)\n"
+    "upstream\tgit@github.com:owner/name.git (push)\n"
+)
+
+
 class FakeRunner:
     """Records commands instead of running git and gh."""
 
     def __init__(self, stdout: dict[str, str] | None = None, fail: str | None = None):
         self.calls: list[list[str]] = []
-        self.stdout = stdout or {}
+        self.stdout = {"git remote -v": REMOTES, **(stdout or {})}
         self.fail = fail
 
     def __call__(self, command, cwd=None, check=True):
         self.calls.append(command)
         joined = " ".join(command)
         if self.fail and self.fail in joined:
+            if not check:
+                return subprocess.CompletedProcess(command, 1, "", "remote rejected")
             raise subprocess.CalledProcessError(1, command, "", "remote rejected")
         out = next((v for k, v in self.stdout.items() if k in joined), "")
         return subprocess.CompletedProcess(command, 0, out, "")
@@ -407,8 +420,9 @@ class TestSubmission:
         [item] = report.submissions
         assert item.status == "submitted"
         assert item.url == "https://github.com/x/y/pull/1"
-        assert runner.ran(f"checkout -B annotation/mannlabs/{ACC} origin/main")
+        assert runner.ran(f"checkout -B annotation/mannlabs/{ACC} upstream/main")
         assert runner.ran("git push origin")
+        assert runner.ran(f"--repo owner/name --base main --head fork:{BRANCH}")
         assert runner.ran("--label sdrf:new")
         assert runner.ran("--label automated")
 
@@ -472,6 +486,34 @@ class TestSubmission:
         )
 
         assert not runner.ran("gh label create")
+
+    @pytest.mark.parametrize(
+        ("present", "expected"),
+        [
+            pytest.param("sdrf:new\n", ("sdrf:new",), id="one-present"),
+            pytest.param("", (), id="none-present"),
+            pytest.param("sdrf:new\nautomated\n", ("sdrf:new", "automated"), id="all"),
+        ],
+    )
+    def test_a_label_that_cannot_be_created_is_skipped(self, present, expected):
+        """Creating a label needs triage rights, which a contributor lacks."""
+        runner = FakeRunner(stdout={"gh label list": present}, fail="gh label create")
+
+        assert contribute.ensure_labels("owner/name", runner) == expected
+
+    def test_a_skipped_label_is_left_off_the_pr(self, work, repo):
+        make_dataset(work)
+        runner = FakeRunner(
+            stdout={"gh label list": "sdrf:new\n"}, fail="gh label create"
+        )
+
+        report = contribute.contribute(
+            work, {}, repo, "owner/name", dry_run=False, validate=False, runner=runner
+        )
+
+        assert report.count("submitted") == 1
+        assert runner.ran("--label sdrf:new")
+        assert not runner.ran("--label automated")
 
     def test_the_operators_checkout_is_never_touched(self, work, repo):
         """Every write happens in a throwaway worktree, not the main checkout."""
@@ -594,3 +636,44 @@ class TestLiveValidationGate:
 
         assert ("--use_ols_cache_only" in command) is cache_only
         assert ("--network" in command) is cache_only
+
+
+class TestRemotes:
+    @pytest.mark.parametrize(
+        ("base_repo", "expected"),
+        [
+            pytest.param("owner/name", ("upstream", "fork"), id="upstream"),
+            pytest.param("Owner/Name", ("upstream", "fork"), id="case-insensitive"),
+            pytest.param("fork/name", ("origin", "fork"), id="the-fork-itself"),
+        ],
+    )
+    def test_the_base_remote_is_the_one_tracking_the_base_repo(
+        self, repo, base_repo, expected
+    ):
+        assert contribute.resolve_remotes(repo, base_repo, FakeRunner()) == expected
+
+    @pytest.mark.parametrize(
+        "remotes",
+        [
+            pytest.param(
+                "origin\thttps://github.com/fork/name.git (fetch)\n", id="no-base"
+            ),
+            pytest.param(
+                "upstream\tgit@github.com:owner/name.git (fetch)\n", id="no-origin"
+            ),
+        ],
+    )
+    def test_a_missing_remote_is_fatal(self, repo, remotes):
+        runner = FakeRunner(stdout={"git remote -v": remotes})
+
+        with pytest.raises(ValueError):
+            contribute.resolve_remotes(repo, "owner/name", runner)
+
+    def test_upstream_curation_is_read_from_the_base_remote(self, work, repo):
+        make_dataset(work)
+        runner = FakeRunner()
+
+        contribute.contribute(work, {}, repo, "owner/name", runner=runner)
+
+        assert runner.ran("git fetch upstream main")
+        assert runner.ran(f"ls-tree -r --name-only upstream/main -- datasets/{ACC}/")

@@ -38,6 +38,7 @@ GIT_TIMEOUT_S = 300
 
 PRIDE_PROJECT_URL = "https://www.ebi.ac.uk/pride/archive/projects/{accession}"
 DOI_URL = "https://doi.org/{doi}"
+_GITHUB_REPO = re.compile(r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
 _DOI = re.compile(r"\b(10\.\d{4,9}/[^\s\"'<>,\]}]+)")
 
 # How many `used_for` entries a cited source shows before it is summarised.
@@ -385,29 +386,79 @@ def pr_body(candidate: Candidate, live_ols: bool) -> str:
 # --------------------------------------------------------------------------
 
 
-def ensure_labels(base_repo: str, runner: CommandRunner) -> None:
-    """Create the PR labels that do not exist yet.
+def ensure_labels(base_repo: str, runner: CommandRunner) -> tuple[str, ...]:
+    """Create the PR labels that do not exist yet, where permitted.
 
     `gh pr create --label` fails outright on an unknown label, which would
-    abort the batch on its first dataset.
+    abort the batch on its first dataset. Creating one needs triage rights on
+    `base_repo`, which a contributor to someone else's repository usually
+    lacks, so a label that cannot be created is left off rather than fatal.
+
+    Returns:
+        The labels that exist on `base_repo`, in `LABELS` order.
     """
     existing = runner(
         ["gh", "label", "list", "--repo", base_repo, "--json", "name", "-q", ".[].name"],
         check=False,
     )
     present = set(existing.stdout.split())
+    usable: list[str] = []
     for name, (color, description) in LABELS.items():
-        if name in present:
-            continue
-        runner(
-            ["gh", "label", "create", name, "--repo", base_repo,
-             "--color", color, "--description", description],
-            check=False,
-        )  # fmt: skip
+        if name not in present:
+            created = runner(
+                ["gh", "label", "create", name, "--repo", base_repo,
+                 "--color", color, "--description", description],
+                check=False,
+            )  # fmt: skip
+            if created.returncode != 0:
+                continue
+        usable.append(name)
+    return tuple(usable)
+
+
+def _remotes(repo: Path, runner: CommandRunner) -> dict[str, str]:
+    """Map each remote of `repo` to the GitHub `owner/name` it fetches from."""
+    result = runner(["git", "remote", "-v"], cwd=repo, check=False)
+    remotes: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and (match := _GITHUB_REPO.search(parts[1])):
+            remotes.setdefault(parts[0], f"{match[1]}/{match[2]}")
+    return remotes
+
+
+def resolve_remotes(repo: Path, base_repo: str, runner: CommandRunner) -> tuple[str, str]:
+    """Find the remote that tracks `base_repo` and the owner of the fork.
+
+    Branches are pushed to `origin`, the fork; everything read as "what the
+    repository already holds" comes from the remote of `base_repo`, because a
+    fork's main can lag upstream or carry commits upstream never merged.
+
+    Returns:
+        (base remote name, fork owner). The owner qualifies `--head`, which gh
+        otherwise looks up in `base_repo` rather than the fork.
+
+    Raises:
+        ValueError: `origin` is not a GitHub remote, or no remote tracks
+            `base_repo`.
+    """
+    remotes = _remotes(repo, runner)
+    if "origin" not in remotes:
+        raise ValueError(f"{repo}: `origin` is not a GitHub remote")
+    base_remote = next(
+        (name for name, slug in remotes.items() if slug.lower() == base_repo.lower()),
+        None,
+    )
+    if base_remote is None:
+        raise ValueError(
+            f"{repo}: no remote tracks {base_repo}; add one with "
+            f"`git remote add upstream https://github.com/{base_repo}.git`"
+        )
+    return base_remote, remotes["origin"].split("/")[0]
 
 
 def existing_annotation(
-    repo: Path, base_branch: str, accession: str, runner: CommandRunner
+    repo: Path, base_ref: str, accession: str, runner: CommandRunner
 ) -> list[str]:
     """List the SDRFs the base branch already carries for one accession.
 
@@ -418,7 +469,7 @@ def existing_annotation(
         Repository-relative paths, empty when the accession is new.
     """
     result = runner(
-        ["git", "ls-tree", "-r", "--name-only", f"origin/{base_branch}",
+        ["git", "ls-tree", "-r", "--name-only", base_ref,
          "--", f"datasets/{accession}/"],
         cwd=repo,
         check=False,
@@ -454,6 +505,9 @@ def submit(
     repo: Path,
     base_repo: str,
     base_branch: str,
+    base_ref: str,
+    head_owner: str,
+    labels: tuple[str, ...],
     live_ols: bool,
     runner: CommandRunner,
     update: bool = False,
@@ -466,6 +520,9 @@ def submit(
         repo: The fork's main checkout, used for remote queries.
         base_repo: `owner/name` the PR is opened against.
         base_branch: Branch the PR targets.
+        base_ref: `remote/branch` of `base_repo` the branch is cut from.
+        head_owner: Owner of the fork the branch is pushed to.
+        labels: Labels to apply; each must already exist on `base_repo`.
         live_ols: Whether live OLS validation ran, for the checklist.
         runner: Command runner, injected so the batch can be tested offline.
         update: The accession is already in the repository, so the pull request
@@ -482,7 +539,7 @@ def submit(
         )
 
     try:
-        runner(["git", "checkout", "-B", branch, f"origin/{base_branch}"], cwd=worktree)
+        runner(["git", "checkout", "-B", branch, base_ref], cwd=worktree)
         paths = _stage_files(worktree, candidate)
         runner(["git", "add", *paths], cwd=worktree)
         message = commit_message(candidate.accession, candidate.model)
@@ -492,10 +549,10 @@ def submit(
             ["gh", "pr", "create",
              "--repo", base_repo,
              "--base", base_branch,
-             "--head", branch,
+             "--head", f"{head_owner}:{branch}",
              "--title", pr_title(candidate.accession, update),
              "--body", pr_body(candidate, live_ols),
-             *(arg for label in LABELS for arg in ("--label", label))],
+             *(arg for label in labels for arg in ("--label", label))],
             cwd=worktree,
         )  # fmt: skip
     except subprocess.CalledProcessError as error:
@@ -579,6 +636,7 @@ def contribute(
 
     Raises:
         FileNotFoundError: `repo` is not a git checkout.
+        ValueError: `repo` has no remote tracking `base_repo`.
     """
     if not (repo / ".git").exists():
         raise FileNotFoundError(f"{repo} is not a git checkout of the dataset repo")
@@ -588,9 +646,10 @@ def contribute(
     if not candidates:
         return report
 
-    runner(["git", "fetch", "origin", base_branch], cwd=repo)
-    if not dry_run:
-        ensure_labels(base_repo, runner)
+    base_remote, head_owner = resolve_remotes(repo, base_repo, runner)
+    base_ref = f"{base_remote}/{base_branch}"
+    runner(["git", "fetch", base_remote, base_branch], cwd=repo)
+    labels = ensure_labels(base_repo, runner) if not dry_run else ()
 
     with tempfile.TemporaryDirectory(prefix="sdrf-contribute-") as scratch:
         worktree = Path(scratch) / "repo"
@@ -599,14 +658,13 @@ def contribute(
             # and `worktree add` refuses to run while they are registered.
             runner(["git", "worktree", "prune"], cwd=repo, check=False)
             runner(
-                ["git", "worktree", "add", "--detach", str(worktree),
-                 f"origin/{base_branch}"],
+                ["git", "worktree", "add", "--detach", str(worktree), base_ref],
                 cwd=repo,
             )  # fmt: skip
         try:
             for candidate in candidates:
                 existing = existing_annotation(
-                    repo, base_branch, candidate.accession, runner
+                    repo, base_ref, candidate.accession, runner
                 )
                 if existing and not allow_update:
                     report.submissions.append(
@@ -655,6 +713,9 @@ def contribute(
                         repo,
                         base_repo,
                         base_branch,
+                        base_ref,
+                        head_owner,
+                        labels,
                         live_ols=validate,
                         runner=runner,
                         update=bool(existing),
