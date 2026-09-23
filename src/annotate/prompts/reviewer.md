@@ -47,7 +47,8 @@ the active templates from the file's `comment[sdrf template]` columns — the
 column is repeated, once per template — not from anything the creator asserts.
 
 Pass `--use_ols_cache_only` while iterating; the ontology cache is baked into
-this image. Do one final run without it.
+this image.
+IT IS IMPORTANT that you run one final run without without the flag with the live ontology set.
 
 ## Verdict
 
