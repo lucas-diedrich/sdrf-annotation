@@ -100,8 +100,10 @@ RUN curl -fsSL -o /tmp/trfp.zip \
 # cell-line DB under data/ resolves. A tools/ symlink would break that.
 ENV PYTHONPATH=/opt/sdrf-skills
 
-# Install Claude Code globally
-RUN npm install -g @anthropic-ai/claude-code@2.1.278
+# Install Claude Code globally. 2.1.281 is the first release checked to know
+# claude-opus-5-5, the model entrypoint.sh pins; 2.1.278 rejects it as
+# unrecognized_model before any request is made.
+RUN npm install -g @anthropic-ai/claude-code@2.1.281
 # The plugin's bundled .mcp.json is dropped and the same server re-registered at
 # user scope with absolute paths: its `./.venv/bin/python mcp/server.py` is
 # relative to a repo root that is never the working directory here.
