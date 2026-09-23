@@ -58,20 +58,12 @@ the file genuinely mixes row kinds, where the union would impose one group's
 constraints on the other's rows.
 
 Pass `--use_ols_cache_only` while iterating. The ontology cache is baked into
-this image, so a cached run takes seconds against 2–3 minutes live. Do one final
-run without the flag before you finish.
+this image, so a cached run takes seconds against 2–3 minutes live.
+IT IS IMPORTANT that you run one final run without without the flag with the live ontology set.
 
 ## Blocked
 
-Two specification gaps are known and are not your fault. Emit
-`outcome: "blocked"` naming the gap rather than writing a value you know to be
-wrong:
-
-1. Mixed tissue + cell-line datasets: `cell-lines` requires
-   `characteristics[cell line]` while forbidding both reserved words, so tissue
-   rows have no legal value.
-2. Sampling-time units lack `second`, report non-integer floating point values in the unit `minute` if you need to report smaller values
-
+If you cannot access the information to annotate data, please report that you are blocked.
 Anything you genuinely cannot determine is `blocked` too. Never invent a
 sample-to-file map, a channel map, demographics, or runs.
 
@@ -105,7 +97,7 @@ End your final message with one fenced ```json block and nothing after it:
 }
 ```
 
-`outcome`
+`outcome` can be one of:
 
 - `completed`
 - `blocked`
