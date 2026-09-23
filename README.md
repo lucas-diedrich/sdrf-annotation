@@ -116,7 +116,7 @@ annotate costs  --work sdrf-annotations/
 
 ### Contribute the passing datasets
 
-One pull request per accession, against your fork of the dataset repo.
+One pull request per accession, pushed to your fork of the dataset repo.
 
 ```bash
 # Dry run: select, validate, render. Pushes nothing. This is the default.
@@ -125,6 +125,10 @@ annotate contribute --work sdrf-annotations/ --repo ../sdrf-annotated-datasets
 # Submit a bounded first batch, then everything
 annotate contribute --work sdrf-annotations/ --limit 5 --no-dry-run
 annotate contribute --work sdrf-annotations/ --no-dry-run
+
+# Target: your fork (the default), or bigbio via the checkout's `upstream` remote
+annotate contribute --work sdrf-annotations/ --base-repo lucas-diedrich/sdrf-annotated-datasets --no-dry-run
+annotate contribute --work sdrf-annotations/ --base-repo bigbio/sdrf-annotated-datasets --no-dry-run
 ```
 
 ### Results layout
