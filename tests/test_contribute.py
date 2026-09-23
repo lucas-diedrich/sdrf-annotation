@@ -29,6 +29,7 @@ def make_dataset(
     files=(f"{ACC}.sdrf.tsv",),
     sources=None,
     references=None,
+    model_usage=None,
 ):
     """Write the on-disk shape of one finished dataset run."""
     paths = DatasetPaths(work, accession)
@@ -58,6 +59,7 @@ def make_dataset(
                         for name in files
                     ],
                     "agent_output": {"spec_gaps": spec_gaps or []},
+                    "usage": {"model_usage": model_usage or {}},
                 }
             )
         )
@@ -138,28 +140,57 @@ class TestSelection:
         assert candidate.branch == f"annotation/mannlabs/{ACC}"
 
 
+class TestCreatorModel:
+    @pytest.mark.parametrize(
+        ("model_usage", "expected"),
+        [
+            pytest.param(
+                {"claude-opus-5[1m]": {"outputTokens": 93221}},
+                "claude-opus-5[1m]",
+                id="single",
+            ),
+            pytest.param(
+                {
+                    "claude-haiku-4-5-20251001": {"outputTokens": 500},
+                    "claude-opus-5[1m]": {"outputTokens": 9000},
+                },
+                "claude-opus-5[1m]",
+                id="most-output-wins",
+            ),
+            pytest.param({}, "claude", id="no-usage"),
+        ],
+    )
+    def test_model_is_read_from_creator_usage(self, work, model_usage, expected):
+        make_dataset(work, model_usage=model_usage)
+
+        [candidate] = contribute.select_candidates(work, {})
+
+        assert candidate.model == expected
+
+
 class TestPullRequestContent:
     def test_commit_message_carries_the_provenance(self):
-        message = contribute.commit_message(ACC)
+        message = contribute.commit_message(ACC, "claude-opus-5[1m]")
 
         assert message.startswith(f"[contribution] Dataset {ACC}")
         assert "@MannLabs" in message
-        assert "`claude-opus-5`" in message
+        assert "`claude-opus-5[1m]`" in message
         assert "sdrf-skills" in message
 
     def test_the_model_is_never_an_at_mention(self):
         """`claude-opus-5` is not a GitHub account, and `@claude` is a stranger."""
-        message = contribute.commit_message(ACC)
+        message = contribute.commit_message(ACC, "claude-opus-5[1m]")
 
         assert "@claude" not in message
 
     def test_the_coauthor_trailer_is_the_last_paragraph(self):
         """Git reads trailers only from the final block."""
-        message = contribute.commit_message(ACC)
+        message = contribute.commit_message(ACC, "claude-opus-5[1m]")
 
         last_paragraph = message.strip().split("\n\n")[-1]
-        assert last_paragraph == contribute.COAUTHOR
-        assert last_paragraph.startswith("Co-Authored-By: Claude Opus 5")
+        assert last_paragraph == (
+            "Co-Authored-By: claude-opus-5[1m] <noreply@anthropic.com>"
+        )
 
     def test_title_names_the_accession(self):
         assert contribute.pr_title(ACC) == f"Add SDRF annotation for {ACC}"
