@@ -5,6 +5,7 @@
     annotate retry  --work work/ --state failed_infra
     annotate rollup --work work/
     annotate purge  --work work/ --raw
+    annotate repair --work work/ --accession PXD000001
     annotate contribute --work work/ --repo ../sdrf-annotated-datasets
     annotate doctor
 
@@ -229,6 +230,74 @@ def retry(
     params = dict(locals())
     params["state"] = state or [State.FAILED_INFRA, State.FAILED_CONTRACT]
     raise typer.Exit(_execute(_config(params)))
+
+
+@app.command()
+def repair(
+    work: WorkOpt = DEFAULT_WORK,
+    seed: Annotated[Path, typer.Option()] = DEFAULT_SEED,
+    env_file: EnvFileOpt = None,
+    accession: Annotated[
+        list[str] | None,
+        typer.Option(
+            help="Check this accession; repeatable. Default: every reviewed_pass dataset."
+        ),
+    ] = None,
+    mark_only: Annotated[
+        bool,
+        typer.Option(help="Send failing datasets back for repair, but run nothing."),
+    ] = False,
+    concurrency: Annotated[int, typer.Option()] = DEFAULT_CONCURRENCY,
+    image: Annotated[str, typer.Option()] = DEFAULT_IMAGE,
+    permission_mode: Annotated[str, typer.Option()] = DEFAULT_PERMISSION_MODE,
+    timeout_s: Annotated[int, typer.Option()] = DEFAULT_TIMEOUT_S,
+    max_repair: Annotated[
+        int | None,
+        typer.Option(
+            help="Repair cap. Default: one more attempt than the most "
+            "any marked dataset has used, so each gets at least one repair run."
+        ),
+    ] = None,
+    raw_budget_gb: Annotated[float, typer.Option()] = DEFAULT_RAW_BUDGET_GB,
+    scratch_gb: Annotated[float, typer.Option()] = DEFAULT_SCRATCH_GB,
+    purge_raw_after: Annotated[str, typer.Option()] = "dataset",
+    keep_raw: Annotated[bool, typer.Option()] = False,
+    dry_run: Annotated[
+        bool, typer.Option(help="Validate and report; change no state, run nothing.")
+    ] = False,
+    prompts_dir: Annotated[Path | None, typer.Option()] = None,
+    preflight: Annotated[bool, typer.Option()] = True,
+) -> None:
+    """Live-validate reviewed datasets and repair the ones that fail.
+
+    Failing datasets go back to the creator with the validator's errors as the
+    repair brief, starting from the existing SDRF, then through the reviewer.
+    """
+    params = dict(locals())
+    params.pop("max_repair")
+    config = _config(params)
+    marks = pipeline.mark_for_repair(work, config, accession or None, dry_run=dry_run)
+    if not marks:
+        typer.echo("no dataset at reviewed_pass matched the selection")
+        raise typer.Exit(EXIT_NOTHING_SELECTED)
+    for mark in marks:
+        suffix = f"  {mark.detail}" if mark.detail else ""
+        typer.echo(f"  {mark.status:<8} {mark.accession:<12}{suffix}")
+
+    marked = [mark for mark in marks if mark.status == "marked"]
+    if dry_run or mark_only or not marked:
+        raise typer.Exit(EXIT_OK)
+    cap = max_repair if max_repair is not None else max(m.attempts for m in marked) + 1
+    typer.echo(f"\nrepairing {len(marked)} dataset(s) with a repair cap of {cap}")
+    raise typer.Exit(
+        _execute(
+            config.replace(
+                accessions=tuple(mark.accession for mark in marked),
+                states=(State.REVIEWED_FAIL,),
+                max_repair=cap,
+            )
+        )
+    )
 
 
 @app.command()

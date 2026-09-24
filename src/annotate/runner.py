@@ -31,6 +31,13 @@ STDERR_TAIL_CHARS = 2048
 # single offline `parse_sdrf` call that takes ~12 s, so anything near this
 # means it is stuck rather than slow.
 VALIDATION_TIMEOUT_S = 300
+# Live OLS resolves every term over the network, 2-3 minutes on a typical file
+# and well past the offline bound on a large one; a timeout here is not a
+# verdict on the file, so the bound is generous.
+LIVE_VALIDATION_TIMEOUT_S = 1200
+# Enough messages to repair from without letting a file with one error per row
+# bloat every status file it is recorded in.
+MAX_VALIDATION_MESSAGES = 50
 
 # Read from the image rather than asserted by the host: a batch spanning days
 # cannot be partitioned by code version afterwards unless each run says which
@@ -454,32 +461,44 @@ def validate_sdrf(
             the cached run cannot support.
 
     Returns:
-        {templates, ran, passed, errors, warnings, detail}. `ran` is False when
-        the validator could not be started at all, which is not a verdict on
-        the file.
+        {templates, ran, passed, errors, warnings, detail, messages}. `ran` is
+        False when the validator could not be started or timed out, which is
+        not a verdict on the file. `messages` holds the ERROR lines, or the
+        output tail of a failure that printed none.
     """
     result: dict[str, Any] = {"templates": templates, "ran": False, "passed": None}
     command = validate_command(sdrf_file, templates, config.image, use_ols_cache_only)
+    timeout = VALIDATION_TIMEOUT_S if use_ols_cache_only else LIVE_VALIDATION_TIMEOUT_S
     try:
         probe = subprocess.run(
             command,
             capture_output=True,
             text=True,
-            timeout=VALIDATION_TIMEOUT_S,
+            timeout=timeout,
             check=False,
         )
-    except (subprocess.TimeoutExpired, OSError) as error:
+    except subprocess.TimeoutExpired:
+        # str(TimeoutExpired) leads with the whole argv, which buries the cause
+        # once the detail is truncated for display.
+        result["detail"] = f"validator timed out after {timeout} s"
+        return result
+    except OSError as error:
         result["detail"] = f"validator could not be run: {error}"
         return result
 
-    lines = (probe.stdout + probe.stderr).splitlines()
+    lines = [line for line in (probe.stdout + probe.stderr).splitlines() if line.strip()]
     errors = [line for line in lines if line.startswith("ERROR")]
+    passed = probe.returncode == 0
+    # A non-zero exit with no ERROR line (a crash, a parse failure) is still a
+    # failure, and its output tail is the only thing a repair can go on.
+    messages = errors or ([] if passed else lines[-5:])
     result.update(
         ran=True,
-        passed=probe.returncode == 0,
+        passed=passed,
         errors=len(errors),
         warnings=sum(1 for line in lines if line.startswith("WARNING")),
-        detail=errors[0][:300] if errors else "",
+        detail=messages[0][:300] if messages else "",
+        messages=[line[:500] for line in messages[:MAX_VALIDATION_MESSAGES]],
     )
     return result
 

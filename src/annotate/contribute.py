@@ -580,20 +580,25 @@ def _validate_live(candidate: Candidate, config: RunConfig) -> str | None:
     The host's own run during the pipeline is `--use_ols_cache_only`, so no
     recorded check supports the "verified against live OLS4" claim. This runs
     it for real, against the network, immediately before the contribution.
+    Each file is checked against its own templates: a dataset-wide union
+    imposed a sibling file's required columns on every file, and rejected
+    correct files split by template.
 
     Returns:
         None when every file passes, otherwise the first failure's detail.
     """
-    from annotate import runner as agent_runner
+    from annotate import pipeline
 
-    for path in candidate.sdrf_files:
-        result = agent_runner.validate_sdrf(
-            path, list(candidate.templates), config, use_ols_cache_only=False
+    failed, not_run = pipeline.validate_live(candidate.sdrf_files[0].parent, config)
+    if failed:
+        first = failed[0]
+        return f"{Path(first['path']).name}: {first.get('detail') or 'validation failed'}"
+    if not_run:
+        first = not_run[0]
+        return (
+            f"{Path(first['path']).name}: validator could not be run: "
+            f"{first.get('detail', '')}"
         )
-        if not result.get("ran"):
-            return f"{path.name}: validator could not be run: {result.get('detail', '')}"
-        if not result.get("passed"):
-            return f"{path.name}: {result.get('detail', 'validation failed')}"
     return None
 
 

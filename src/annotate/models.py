@@ -63,6 +63,9 @@ class Event(StrEnum):
     INFRA_FAILURE = "infra_failure"
     CONTRACT_FAILURE = "contract_failure"
     REPAIR_EXHAUSTED = "repair_exhausted"
+    # The host's own `parse_sdrf` run rejected the SDRF. Treated as a failed
+    # review, so it feeds the same repair loop and counts against the same cap.
+    VALIDATION_FAIL = "validation_fail"
     # Not a transition and deliberately absent from TRANSITIONS: `transition()`
     # must reject it. It is written to the event log by a re-derivation whose
     # result disagrees with the last transition, so the log ends by explaining
@@ -140,6 +143,13 @@ TRANSITIONS: dict[tuple[State, Event], State] = {
     # Repair cap reached: a dataset the reviewer keeps rejecting is unresolvable
     # by this pipeline, which is the definition of blocked.
     (State.REVIEWED_FAIL, Event.REPAIR_EXHAUSTED): State.BLOCKED,
+    # The gate between creator and reviewer: an SDRF that does not validate
+    # goes back to the creator without spending a reviewer run on it.
+    (State.CREATED, Event.VALIDATION_FAIL): State.REVIEWED_FAIL,
+    # The one exit from a terminal state, taken only by `annotate repair`: a
+    # reviewed file that fails live OLS validation is not publishable, and the
+    # pipeline's cached check cannot see what only live OLS rejects.
+    (State.REVIEWED_PASS, Event.VALIDATION_FAIL): State.REVIEWED_FAIL,
 }
 
 
@@ -234,6 +244,15 @@ class DatasetPaths:
         cannot find afterwards is a report nobody reads.
         """
         return self.review / f"{accession or self.accession}.review.json"
+
+    @property
+    def validation(self) -> Path:
+        """The host's record of a validation that rejected the SDRF.
+
+        Keyed by attempt, so a record describing a superseded file is
+        recognisable as stale rather than having to be deleted.
+        """
+        return self.logs / "validation.json"
 
     @property
     def logs(self) -> Path:

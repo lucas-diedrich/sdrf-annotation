@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import shutil
 import sys
+import tempfile
 import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -196,6 +197,10 @@ def derive_rollup(paths: DatasetPaths, max_repair: int) -> DatasetRollup:
         return rollup
 
     rollup.state = State.CREATED
+    # Checked before the reviewer: the gate means no reviewer ran on a file the
+    # host rejected, and `annotate repair` overrides a pass the reviewer gave.
+    if rejected_validation(paths, creator_run.attempt):
+        return _failed_review(rollup, attempts, max_repair)
     # A reviewer status from an earlier attempt describes a superseded artifact;
     # the review has to be redone, so the dataset stays at `created`.
     if reviewer is None:
@@ -218,15 +223,70 @@ def derive_rollup(paths: DatasetPaths, max_repair: int) -> DatasetRollup:
             rollup.state = State.BLOCKED
             rollup.blocked_reason = reviewer_run.blocked_reason
         case Verdict.FAIL:
-            if attempts > max_repair:
-                rollup.state = State.BLOCKED
-                rollup.blocked_reason = f"repair cap of {max_repair} attempts reached"
-            else:
-                rollup.state = State.REVIEWED_FAIL
+            return _failed_review(rollup, attempts, max_repair)
         case _:
             rollup.state = State.FAILED_CONTRACT
             rollup.failed_step = Step.REVIEWER
     return rollup
+
+
+def _failed_review(
+    rollup: DatasetRollup, attempts: int, max_repair: int
+) -> DatasetRollup:
+    if attempts > max_repair:
+        rollup.state = State.BLOCKED
+        rollup.blocked_reason = f"repair cap of {max_repair} attempts reached"
+    else:
+        rollup.state = State.REVIEWED_FAIL
+    return rollup
+
+
+def rejected_validation(paths: DatasetPaths, attempt: int) -> dict[str, Any] | None:
+    """The host validation record that rejected `attempt`'s SDRF, if any."""
+    record = read_json(paths.validation)
+    if record and record.get("attempt") == attempt and record.get("failed"):
+        return record
+    return None
+
+
+def record_validation_failure(
+    paths: DatasetPaths,
+    rollup: DatasetRollup,
+    failed: list[dict[str, Any]],
+    *,
+    live: bool,
+    step: Step | None = None,
+) -> DatasetRollup:
+    """Persist a validation rejection and send the dataset back for repair.
+
+    Args:
+        paths: Dataset paths.
+        rollup: The rollup, at `created` or `reviewed_pass`.
+        failed: The failing checks, as `artifacts.validation_failures` returns.
+        live: Whether the checks ran against live OLS rather than the cache.
+        step: The step whose artifact was rejected, for the history entry.
+
+    Returns:
+        The rollup, advanced to `reviewed_fail`.
+    """
+    write_json(
+        paths.validation,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "accession": paths.accession,
+            "attempt": rollup.attempts,
+            "live": live,
+            "checked": now_iso(),
+            "failed": failed,
+        },
+    )
+    source = "live" if live else "cached"
+    first = failed[0]
+    detail = (
+        f"{len(failed)} failing {source} parse_sdrf check(s); "
+        f"{Path(first.get('path', '')).name}: {first.get('detail', '')}"
+    )
+    return apply_event(paths, rollup, Event.VALIDATION_FAIL, step=step, detail=detail)
 
 
 def workflow_rollup(work: Path) -> dict[str, Any]:
@@ -463,6 +523,28 @@ def summarize_artifacts(
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+def validate_live(
+    sdrf_dir: Path, config: RunConfig
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Validate every SDRF in `sdrf_dir` against live OLS.
+
+    Each file is checked against its own declared templates, split by row group
+    exactly as the pipeline's cached check is.
+
+    Returns:
+        (failed, not_run), as `artifacts.validation_failures` returns them.
+    """
+    with tempfile.TemporaryDirectory(prefix="annotate-live-") as scratch:
+        summary = artifacts.summarize(
+            sdrf_dir,
+            validate=partial(
+                runner.validate_sdrf, config=config, use_ols_cache_only=False
+            ),
+            scratch=Path(scratch),
+        )
+    return artifacts.validation_failures(summary)
+
+
 def host_notes(
     paths: DatasetPaths, step: Step, run: RunResult, payload: dict[str, Any] | None
 ) -> list[str]:
@@ -597,6 +679,7 @@ def run_step(
     config: RunConfig,
     title: str,
     review_for_repair: dict[str, Any] | None = None,
+    validation_for_repair: dict[str, Any] | None = None,
 ) -> tuple[DatasetRollup, dict[str, Any] | None]:
     """Run one agent and fold its result into the dataset rollup.
 
@@ -607,6 +690,8 @@ def run_step(
         config: Run configuration.
         title: Dataset title from the seed, injected into the prompt.
         review_for_repair: The previous reviewer payload on a repair run.
+        validation_for_repair: The host validation record that rejected the
+            previous SDRF, on a repair run caused by it.
 
     Returns:
         (rollup, payload) where payload is the validated agent output, or None
@@ -620,7 +705,13 @@ def run_step(
         apply_event(paths, rollup, Event.start(step), step=step)
 
     prompt = prompts.build(
-        step, paths.accession, title, config, review_for_repair, attempt
+        step,
+        paths.accession,
+        title,
+        config,
+        review_for_repair,
+        attempt,
+        validation_for_repair,
     )
     # Written by the host, not the runner, so the exact prompt a run received is
     # on disk even when the container never starts.
@@ -647,6 +738,7 @@ def run_step(
 
     runner.prune_config_dir(paths, step)
     notes += host_notes(paths, step, run, payload)
+    artifact_summary = summarize_artifacts(paths, step, config)
     write_run_status(
         paths,
         step,
@@ -657,7 +749,7 @@ def run_step(
         on_disk,
         started,
         notes,
-        artifact_summary=summarize_artifacts(paths, step, config),
+        artifact_summary=artifact_summary,
         provenance=runner.image_provenance(config.image),
     )
 
@@ -686,7 +778,16 @@ def run_step(
 
     assert payload is not None
     if step is Step.CREATOR:
-        return _classify_creator(paths, rollup, payload, config), payload
+        rollup = _classify_creator(paths, rollup, payload, config)
+        # The reviewer is asked to run parse_sdrf but nothing makes it, and it
+        # passed files that do not validate. The host's check is mechanical and
+        # already done, so it decides instead of being recorded and ignored.
+        failed, _ = artifacts.validation_failures(artifact_summary)
+        if rollup.state is State.CREATED and failed:
+            rollup = record_validation_failure(
+                paths, rollup, failed, live=False, step=Step.CREATOR
+            )
+        return rollup, payload
     return _classify_reviewer(paths, rollup, payload), payload
 
 
@@ -751,10 +852,18 @@ def process_dataset(
 
         if step is Step.CREATOR:
             repairing = rollup.state is State.REVIEWED_FAIL
+            # A validation rejection of the current attempt means no reviewer
+            # judged this file: the reviewer status on disk, if any, describes
+            # an earlier one (gate) or a pass the validator overrode (repair).
+            validation = (
+                rejected_validation(paths, rollup.attempts) if repairing else None
+            )
+            review = None
+            if repairing and validation is None:
+                previous = read_json(paths.status(Step.REVIEWER))
+                review = (previous or {}).get("agent_output")
             rollup.attempts += 1
-            previous = read_json(paths.status(Step.REVIEWER)) if repairing else None
-            review = (previous or {}).get("agent_output") if repairing else None
-            rollup, _ = run_step(step, paths, rollup, config, title, review)
+            rollup, _ = run_step(step, paths, rollup, config, title, review, validation)
             if config.dry_run:
                 return rollup
             purge_raw(paths, config, "creator")
@@ -850,6 +959,75 @@ def select_datasets(config: RunConfig) -> list[SeedRow]:
 
     rows = [row for row in candidates if selected(row)]
     return rows[: config.limit] if config.limit else rows
+
+
+@dataclass(frozen=True, slots=True)
+class RepairMark:
+    """What `mark_for_repair` found for one dataset."""
+
+    accession: str
+    # marked | passed | not_run | skipped
+    status: str
+    attempts: int = 0
+    detail: str = ""
+
+
+def mark_for_repair(
+    work: Path,
+    config: RunConfig,
+    accessions: list[str] | None = None,
+    dry_run: bool = False,
+) -> list[RepairMark]:
+    """Live-validate reviewed datasets and send the failing ones back for repair.
+
+    A dataset whose SDRF fails is moved from `reviewed_pass` to `reviewed_fail`
+    with the validator's errors recorded, so the next pipeline run repairs the
+    existing file instead of annotating from scratch.
+
+    Args:
+        work: Workflow root.
+        config: Run configuration, for the validator image.
+        accessions: Restrict to these accessions. None checks every dataset at
+            `reviewed_pass`.
+        dry_run: Validate and report, but change no state.
+
+    Returns:
+        One mark per dataset considered, in accession order.
+    """
+    wanted = set(accessions or [])
+    marks: list[RepairMark] = []
+    for rollup_path in sorted(work.glob("*/logs/status.json")):
+        rollup = DatasetRollup.from_dict(read_json(rollup_path) or {"accession": ""})
+        if not rollup.accession or (wanted and rollup.accession not in wanted):
+            continue
+        if rollup.state is not State.REVIEWED_PASS:
+            marks.append(
+                RepairMark(
+                    rollup.accession,
+                    "skipped",
+                    rollup.attempts,
+                    f"state is {rollup.state}, not {State.REVIEWED_PASS}",
+                )
+            )
+            continue
+        paths = DatasetPaths(work, rollup.accession)
+        failed, not_run = validate_live(paths.sdrf, config)
+        if failed:
+            if not dry_run:
+                record_validation_failure(paths, rollup, failed, live=True)
+            first = failed[0]
+            detail = f"{Path(first['path']).name}: {first.get('detail', '')}"
+            marks.append(RepairMark(rollup.accession, "marked", rollup.attempts, detail))
+        elif not_run:
+            # No verdict is not a failure: repairing against it would send the
+            # creator after an error nobody observed.
+            detail = not_run[0].get("detail", "")
+            marks.append(RepairMark(rollup.accession, "not_run", rollup.attempts, detail))
+        else:
+            marks.append(RepairMark(rollup.accession, "passed", rollup.attempts))
+    if not dry_run:
+        write_json(work / "status.json", workflow_rollup(work))
+    return marks
 
 
 @dataclass(slots=True)

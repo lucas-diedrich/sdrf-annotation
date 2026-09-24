@@ -195,3 +195,29 @@ def _validate_file(
             write_subset(target, header, group_rows)
         results.append(validate(target, templates))
     return results
+
+
+def validation_failures(
+    summary: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split a summary's validation results into failures and non-verdicts.
+
+    Args:
+        summary: The output of `summarize`.
+
+    Returns:
+        (failed, not_run). Each entry is one validation result carrying the
+        `path` of the file it belongs to. `failed` holds checks that ran and
+        rejected the file; `not_run` holds checks that never produced a verdict,
+        which say nothing about the file and must not be repaired against.
+    """
+    failed: list[dict[str, Any]] = []
+    not_run: list[dict[str, Any]] = []
+    for entry in summary:
+        for result in entry.get("validation") or []:
+            located = {"path": entry.get("path", ""), **result}
+            if not result.get("ran"):
+                not_run.append(located)
+            elif not result.get("passed"):
+                failed.append(located)
+    return failed, not_run

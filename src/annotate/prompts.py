@@ -85,6 +85,52 @@ def repair_brief(review: dict[str, Any], attempt: int) -> str:
     return "\n".join(lines)
 
 
+def validation_brief(validation: dict[str, Any], attempt: int) -> str:
+    """Render a host validation rejection as a repair brief for the creator.
+
+    Args:
+        validation: The host's validation record, as `logs/validation.json`
+            holds it.
+        attempt: The attempt number this repair run will be.
+
+    Returns:
+        A markdown block, or "" when the record holds no failure.
+    """
+    failed = validation.get("failed") or []
+    if not failed:
+        return ""
+    live = bool(validation.get("live"))
+    source = (
+        "against live OLS (without `--use_ols_cache_only`)"
+        if live
+        else "with `--use_ols_cache_only`"
+    )
+    lines = [
+        "",
+        f"## Repair brief (attempt {attempt})",
+        "",
+        f"The host ran `parse_sdrf validate-sdrf` {source} over the previous",
+        "SDRF and it failed. No reviewer judged that version: a file that does",
+        "not validate is sent back before review. Fix every error below, then",
+        "re-run the validator on each file yourself, with exactly the",
+        "`--template` values listed for it, until it passes.",
+        "",
+    ]
+    if live:
+        lines += [
+            "Your final validation must also run without `--use_ols_cache_only`:",
+            "that is the check this file failed.",
+            "",
+        ]
+    for index, check in enumerate(failed, start=1):
+        templates = " ".join(f"-t {name}" for name in check.get("templates") or [])
+        lines.append(f"{index}. `{check.get('path', '')}` ({templates})")
+        messages = check.get("messages") or [check.get("detail") or "failed"]
+        lines += [f"   - {message}" for message in messages]
+    lines.append("")
+    return "\n".join(lines)
+
+
 def build(
     step: Step,
     accession: str,
@@ -92,6 +138,7 @@ def build(
     config: RunConfig,
     review_for_repair: dict[str, Any] | None = None,
     attempt: int = 1,
+    validation_for_repair: dict[str, Any] | None = None,
 ) -> str:
     """Render the prompt one agent run will receive.
 
@@ -102,17 +149,23 @@ def build(
         config: Run configuration, for a prompts-dir override.
         review_for_repair: Previous reviewer payload on a repair run.
         attempt: Attempt number, shown in the repair brief.
+        validation_for_repair: The host validation record that rejected the
+            previous SDRF, on a repair run caused by it.
 
     Returns:
         The fully rendered prompt.
     """
+    if validation_for_repair:
+        repair = validation_brief(validation_for_repair, attempt)
+    elif review_for_repair:
+        repair = repair_brief(review_for_repair, attempt)
+    else:
+        repair = ""
     return render(
         prompt_path(step, config),
         {
             "ACCESSION": accession,
             "TITLE": title or "(no title in seed)",
-            "REPAIR_SECTION": repair_brief(review_for_repair, attempt)
-            if review_for_repair
-            else "",
+            "REPAIR_SECTION": repair,
         },
     )
