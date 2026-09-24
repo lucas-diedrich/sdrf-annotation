@@ -35,6 +35,8 @@ class TestTransitions:
             (State.REVIEWED_FAIL, Event.REPAIR_EXHAUSTED, State.BLOCKED),
             (State.FAILED_INFRA, Event.START_CREATOR, State.CREATING),
             (State.FAILED_CONTRACT, Event.START_REVIEWER, State.REVIEWING),
+            (State.CREATED, Event.VALIDATION_FAIL, State.REVIEWED_FAIL),
+            (State.REVIEWED_PASS, Event.VALIDATION_FAIL, State.REVIEWED_FAIL),
         ],
     )
     def test_legal_transitions(self, state, event, expected):
@@ -54,9 +56,10 @@ class TestTransitions:
         with pytest.raises(TransitionError):
             transition(state, event)
 
-    def test_terminal_states_accept_nothing(self):
-        for state in TERMINAL_STATES:
-            assert not [key for key in TRANSITIONS if key[0] is state]
+    def test_terminal_states_accept_only_a_validation_reopen(self):
+        exits = [key for key in TRANSITIONS if key[0] in TERMINAL_STATES]
+
+        assert exits == [(State.REVIEWED_PASS, Event.VALIDATION_FAIL)]
 
     def test_every_transition_uses_declared_enum_members(self):
         assert {state for state, _ in TRANSITIONS} <= set(State)
@@ -204,6 +207,29 @@ class TestDeriveRollup:
         self._write_run(paths, Step.CREATOR, outcome="completed", attempt=2)
 
         assert pipeline.derive_rollup(paths, max_repair=2).state is State.CREATED
+
+    @pytest.mark.parametrize(
+        ("validation_attempt", "reviewer_verdict", "expected"),
+        [
+            pytest.param(2, None, State.REVIEWED_FAIL, id="gate-rejected"),
+            pytest.param(2, "pass", State.REVIEWED_FAIL, id="repair-overrides-pass"),
+            pytest.param(1, "pass", State.REVIEWED_PASS, id="stale-record-ignored"),
+        ],
+    )
+    def test_a_validation_rejection_of_the_current_attempt_is_a_failed_review(
+        self, work, validation_attempt, reviewer_verdict, expected
+    ):
+        paths = DatasetPaths(work, "PXD000001")
+        paths.scaffold()
+        self._write_run(paths, Step.CREATOR, outcome="completed", attempt=2)
+        if reviewer_verdict:
+            self._write_run(paths, Step.REVIEWER, verdict=reviewer_verdict, attempt=2)
+        write_json(
+            paths.validation,
+            {"attempt": validation_attempt, "failed": [{"path": "sdrf/x.sdrf.tsv"}]},
+        )
+
+        assert pipeline.derive_rollup(paths, max_repair=2).state is expected
 
 
 class TestWorkflowRollup:
