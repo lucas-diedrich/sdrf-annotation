@@ -38,6 +38,16 @@ artifacts from git against a merge base, and a bare mounted `sdrf/` is not a
 repository. The creator declares artifact _paths_ only: a producer hashing its
 own output proves nothing, so the host hashes the disk itself.
 
+**Validation gate.** The host validates every SDRF after the creator, offline
+and per file: each row group is checked against only the templates it declares.
+A failing file never reaches the reviewer. The dataset moves to `reviewed_fail`
+(`validation_fail` event), the errors are written to `logs/validation.json`, and
+the next creator run receives them as its repair brief, counted against the
+same repair cap. The reviewer is also asked to run `parse_sdrf`, but nothing
+enforces that, and it passed files that did not validate. `annotate repair`
+reuses the same path for a live-OLS failure found after review. It is the one
+transition out of the terminal `reviewed_pass`.
+
 **Disk is enforced by the host, not the prompt.** `raw/` is polled during the
 run and the container is killed on a breach (`--raw-budget-gb`, default 20). The
 container's own scratch space is a size-capped tmpfs (`--scratch-gb`, default 2),

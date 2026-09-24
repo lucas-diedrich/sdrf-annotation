@@ -131,6 +131,28 @@ annotate contribute --work sdrf-annotations/ --base-repo lucas-diedrich/sdrf-ann
 annotate contribute --work sdrf-annotations/ --base-repo bigbio/sdrf-annotated-datasets --no-dry-run
 ```
 
+### Repair datasets that fail live validation
+
+The pipeline validates every SDRF offline (`--use_ols_cache_only`) after the
+creator, and sends a failing file straight back to the creator with the
+validator's errors, before any reviewer run. A term that only live OLS rejects
+is caught later, by `contribute`. `repair` sends those datasets back through the
+loop, starting from the existing SDRF instead of annotating from scratch:
+
+```bash
+# Live-validate and report; changes nothing
+annotate repair --work sdrf-annotations/ --accession PXD012056 --dry-run
+
+# Send failing datasets back to the creator and run creator -> gate -> reviewer
+annotate repair --work sdrf-annotations/ --accession PXD012056 --accession PXD021559
+
+# Then contribute the repaired datasets as usual
+annotate contribute --work sdrf-annotations/ --accession PXD012056 --no-dry-run
+```
+
+Without `--accession`, every `reviewed_pass` dataset is validated live (2–3
+minutes each).
+
 ### Results layout
 
 ```
@@ -146,6 +168,7 @@ sdrf-annotations/
     raw/                    # raw MS files, purged at a terminal state
     logs/                   # never mounted into any container
       status.json           # dataset rollup + state machine (derived)
+      validation.json       # host parse_sdrf rejection of the current attempt
       events.jsonl          # append-only event log; never rewritten
       creator/
         session.jsonl       # the full agent trace
